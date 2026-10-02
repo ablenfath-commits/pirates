@@ -1862,6 +1862,8 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
     PISTOL:   { damage: 24, clip: 5, fireDelay: 0.64, reload: 1.8, range: 200, far: 100, spread: 0.018, aimSpread: 0.006 },
     CUTLASS:  { damage: 100, range: 2.2, cooldown: 0.7, arc: 1.2 },
     CARRY_SPEED: 0.25,        // speed multiplier while carrying the chest
+    CROUCH: { speed: 0.5, spread: 0.5, drop: 0.45 },   // crouched (Ctrl / C): x walk speed, x gun spread, m lower
+    FALL: { t0: 0.75, dps: 120 },                      // a landing after more than t0 s in the air: (air s - t0) x dps
     PICKUP_RADIUS: 1.8,
     TEAM_COLORS: [0x2f7fd8, 0xd8402f, 0xd9d2bf],   // team 0, team 1, skeletons (2)
     TEAM_NAMES: ['Синие', 'Алые', 'Скелеты'],
@@ -1969,6 +1971,12 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
     return p || c.requestPointerLock();
   }
   G.input.gameWantsLock = gameWantsLock;
+  // Ctrl is crouch, and Ctrl+W (crouch + forward) closes the tab — the browser does not let a page stop that: mid-round
+  // it asks first
+  window.addEventListener('beforeunload', (e) => {
+    const M = G.match;
+    if (M && M.running && !G.playable && !/[?&]autostart=/.test(location.search)) { e.preventDefault(); e.returnValue = ''; }   // (not in an ad)
+  });
 
   let mAvg = 0, mDrop = 0, held = null;
   G.input.drops = () => mDrop;          // debug: mouse events dropped as glitches
@@ -1977,6 +1985,7 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
     window.addEventListener('keydown', (e) => {
       if (e.target && (e.target.tagName === 'INPUT' || e.target.tagName === 'TEXTAREA')) return;
       if (PREVENT.has(e.code)) e.preventDefault();
+      if ((e.ctrlKey || e.metaKey) && gameWantsLock()) e.preventDefault();   // crouch = Ctrl: no Ctrl+S / D / F ... mid-round
       if (e.code === 'Escape' && input.soft) { input.unlock(); return; }
       if (!e.repeat) input.pressed.add(e.code);
       input.down.add(e.code);
@@ -2155,7 +2164,7 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
     gpuMs: 0, frameMs: 0, changes: 0 };
   try { if (new URLSearchParams(location.search).get('drs') === '0') DRS.on = false; } catch (e) { /* ignore */ }
   let dq = null;
-  function basePixelRatio() { return Math.min(window.devicePixelRatio || 1, 1.75); }
+  function basePixelRatio() { return Math.min(window.devicePixelRatio || 1, G.maxDpr || 1.75); }   // (G.maxDpr: the playable on a phone)
   function drsScale(s) {
     s = Math.round(Math.max(0.5, Math.min(1, s)) * 100) / 100;
     if (dq) { dq.ms.length = 0; dq.dt.length = 0; dq.last = performance.now(); }
@@ -2432,7 +2441,8 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
   let wind = null, tallDepth = null, plantDepth = null, treeDepth = null, WX = 1, WZ = 0;   // wind uniforms (tall grass shader) + prevailing direction
   let palms = [], sails = [], fire = null, fireLight = null;
   let PTB = null, trunks = null, fallen = [], RAY_COL = null;   // palm trunks batch / mesh, falling crowns, last ray hit collider
-  let treeMesh = null, treeTris = 0, treeFellMat = null;        // the trees batch (+ its triangle count before G.detailize)
+  let treeMesh = null, treeTris = 0, treeFellMat = null;
+  let lianaMesh = null, LIANAS = [], RUINS = [];                           // vines slung between trees / palms (dropped when one falls)        // the trees batch (+ its triangle count before G.detailize)
   let BKB = null, brkMesh = null, BRK = [];                          // breakable crates / barrels / pots: batch, mesh, records
   let TGP = [], PUSH = null, rustleT = new WeakMap(), creakT = 0, smokeT = 0;   // tall grass patches, actors pushing plants
   let TPL = null;
@@ -4276,6 +4286,7 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
         plant(pb, kr < 0.45 ? 4 : kr < 0.7 ? 2 : kr < 0.85 ? 10 : 0, x, z, frn(0.6, 1.0), fSeed());
       }
     }
+    buildLianas(trees);
 
     // bushes (walk-through decor, swayed by the wind), in clumps: leafy shrubs on twigs (some in flower, some red / yellow
     // crotons), tropical broadleaves, spiky rosettes, heliconias, big grass clumps, now and then a banana, with ferns,
@@ -4349,6 +4360,38 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
         if (reedAt(LAGOON.x + Math.cos(a) * d, LAGOON.z + Math.sin(a) * d)) k++;
       }
     }
+    // reed beds on the sea shore too (own stream): low, gentle flats at the waterline — half on the wet ground, half
+    // standing in the shallows — stretched along the shore, 6-14 clumps each; more round a lagoon
+    {
+      const rr = G.util.rng(((W.seed | 0) ^ 0x3e1d57) >>> 0), rrn = (a, c) => a + (c - a) * rr(), rSeed = () => 1 + Math.floor(rr() * 2147483000);
+      const bedAt = (x, z) => {
+        const g = heightAt(x, z);
+        if (g < -0.5 || g > 1.0 || steepAt(x, z) > 0.55 || narrowD(x, z) < 3 || !propOK(x, z, 0.25, false)) return false;
+        plant(pb, 7, x, z, rrn(0.75, 1.3), rSeed());
+        return true;
+      };
+      const nb = Math.round((3 + AREA * 2.5) * (VAR === 'lush' ? 1.4 : VAR === 'rocky' ? 0.5 : 1));
+      for (let bd = 0, t = 0; bd < nb && t < nb * 50; t++) {
+        const p = bandPt(rr, -0.8, 3);
+        if (!p) continue;
+        const g = heightAt(p.x, p.z);
+        if (g < -0.4 || g > 0.7 || steepAt(p.x, p.z) > 0.4 || !propOK(p.x, p.z, 1.5, false)) continue;
+        const ya = seaYaw(p.x, p.z), tx = Math.cos(ya), tz = -Math.sin(ya), nx = Math.sin(ya), nz = Math.cos(ya);
+        const want = 6 + Math.floor(rr() * 9), len = rrn(2.5, 5);
+        let n = 0;
+        for (let tt = 0; n < want && tt < want * 5; tt++) {
+          const u = rrn(-1, 1) * len, w = rrn(-1.6, 1.6);
+          if (bedAt(p.x + tx * u + nx * w, p.z + tz * u + nz * w)) n++;
+        }
+        if (n >= 4) bd++;
+      }
+      if (LAGOON) {
+        for (let k = 0, t = 0; k < 12 && t < 90; t++) {
+          const a = rr() * TAU, d = LAGOON.r * rrn(0.55, 1.05);
+          if (bedAt(LAGOON.x + Math.cos(a) * d, LAGOON.z + Math.sin(a) * d)) k++;
+        }
+      }
+    }
     // driftwood on the upper beach: a bleached log (a branch stub, a root knot) crawled over like a low boulder
     const cDrift = [C(0xc9bda8), C(0xb3a690), C(0x9d917d)];
     nW = Math.round(4 * AREA) + (VAR === 'rocky' ? 2 : 0);
@@ -4371,6 +4414,7 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
       W.colliders.push({ x: p.x, z: p.z, r: L * 0.5 + r, y0: g - 1, top: rk.top, kind: 'rock', walk: rk.h <= ROCK_JUMP, rh: rk.h });
       n++;
     }
+    buildRuins(b);                                      // ruin debris + mossy logs (own stream)
     aoSoft = [b.p.length, 0];                           // (from here: a light contact shade only)
     // dry fronds fallen under the palms (flat on the ground)
     const cDry = [C(0xb59b5c), C(0x9c8049), C(0x86683a)];
@@ -4390,6 +4434,7 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
         for (let sd = -1; sd <= 1; sd += 2) upTri(at(t, 0), at(t + 0.22, 0), at(t + 0.12, w * sd * frn(0.8, 1.2)), col, 0.9 + fr() * 0.2);
       }
     }
+    buildBeachBits(b, upTri);                           // shells, starfish, seaweed on the beaches (own stream)
     // clay pots by the landings and round the camp: last, from their own stream (the rest of the layout stays as it was)
     {
       const pr = G.util.rng(((W.seed | 0) ^ 0x5f3c21) >>> 0), prn = (a, b2) => a + (b2 - a) * pr();
@@ -4421,6 +4466,318 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
     if (plantMesh(pb)) { W.tri.bushes = pb.p.length / 9; W.tri.plants = pb.n; }
     treeMesh = plantMesh(tb, null, 'trees'); treeTris = tb.p.length / 9;
     if (treeMesh) { W.tri.trees = tb.p.length / 9; W.tri.treeN = trees.length; }
+    if (LB && LB.p.length) {
+      lianaMesh = plantMesh(LB, null, 'trees');
+      lianaMesh.name = 'lianas'; lianaMesh.castShadow = true; lianaMesh.material.userData.wxSnow = 0.5;
+      W.tri.lianas = LB.p.length / 9; W.tri.lianaN = LIANAS.length;
+    }
+    LB = null;
+  }
+
+  // ---- lianas: vines slung between neighbouring broadleaf trees / palms (their own stream). Each sags between its
+  // two anchors (up in a crown / high on a palm trunk) but never lower than 2.5 m over the ground (walked under), with
+  // leaves along it, hanging tendrils and now and then small flowers. Swayed like the trees (bw.x grows towards its
+  // middle); when a tree or palm it hangs from is felled it drops to the ground (lianaCut)
+  let LB = null, LIANA_C = null;
+  function buildLianas(trees) {
+    if (!LIANA_C) LIANA_C = [C(0x77843f), C(0x6c7d3c), C(0x857a46)];
+    LB = new PlantBatch(); LIANAS = [];
+    const lr = G.util.rng(((W.seed | 0) ^ 0x6b41a3) >>> 0), lrn = (a, c) => a + (c - a) * lr(), P = plantPals();
+    PR = lr;                                             // (the leaf / bloom shapes draw from the vines' stream too)
+    const anc = [];
+    for (let i = 0; i < trees.length; i++) {
+      const t = trees[i];
+      if (t.kind === 'dead' || t.kind === 'pandan') continue;
+      anc.push({ kind: 'tree', id: i, x: t.col.x, z: t.col.z, y: t.y + t.h * lrn(0.52, 0.66), r: 0.9, n: 0 });
+    }
+    for (let i = 0; i < palms.length; i++) {
+      const p = palms[i];
+      if (p.bent) continue;
+      const q = trunkAt(p, trunkArc(p)[4] * lrn(0.62, 0.78));
+      anc.push({ kind: 'palm', id: i, x: q.x, z: q.z, y: q.y, r: q.r + 0.03, n: 0 });
+    }
+    const want = Math.round(24 * AREA * (VAR === 'lush' ? 1.5 : VAR === 'rocky' ? 0.5 : 1));
+    for (let k = anc.length - 1; k > 0; k--) { const j = Math.floor(lr() * (k + 1)); const t = anc[k]; anc[k] = anc[j]; anc[j] = t; }
+    for (let i = 0; i < anc.length && LIANAS.length < want; i++) {
+      const A = anc[i];
+      if (A.n >= 2) continue;
+      const cand = [];
+      for (let j = 0; j < anc.length; j++) {
+        const B = anc[j];
+        if (B === A || B.n >= 2 || (B.kind === A.kind && B.id === A.id)) continue;
+        const d = Math.hypot(B.x - A.x, B.z - A.z);
+        if (d < 4.5 || d > 13 || Math.abs(B.y - A.y) > 3.5 || LIANAS.some((l) => (l.a === A && l.b === B) || (l.a === B && l.b === A))) continue;
+        cand.push([d, B]);
+      }
+      if (!cand.length) continue;
+      cand.sort((p, q) => p[0] - q[0]);
+      const B = cand[Math.floor(lr() * Math.min(3, cand.length))][1];
+      if (lianaOne(A, B, lr, lrn, P)) { A.n++; B.n++; }
+    }
+    PR = Math.random;
+  }
+  function lianaOne(A, B, lr, lrn, P) {
+    const d = Math.hypot(B.x - A.x, B.z - A.z), ux = (B.x - A.x) / d, uz = (B.z - A.z) / d;
+    const ax = A.x + ux * A.r, az = A.z + uz * A.r, bx = B.x - ux * B.r, bz = B.z - uz * B.r;
+    let sag = clamp(d * lrn(0.16, 0.26), 1.0, 3.2);
+    const at = (t, sg) => [ax + (bx - ax) * t, A.y + (B.y - A.y) * t - sg * 4 * t * (1 - t), az + (bz - az) * t];
+    for (let tries = 0; tries < 4; tries++) {                       // shallower until it clears heads, the ground, the set pieces
+      let ok = true;
+      for (let k = 1; k < 10 && ok; k++) {
+        const q = at(k / 10, sag), g = heightAt(q[0], q[2]);
+        if (q[1] < g + 2.6 || decoHit(q[0], q[2], 0.3) || onTower(q[0], q[2], 0.5)) ok = false;
+      }
+      if (ok) break;
+      sag *= 0.6;
+      if (tries === 3 || sag < 0.35) return false;
+    }
+    const lb = LB, v0 = lb.p.length / 3, n = 12, side = lr() < 0.5 ? -1 : 1, wob = lrn(0.1, 0.35);
+    lb.g = -1e3; lb.h = 1; lb.rk = 0; lb.sk = 0;                  // (sway weights are set below)
+    const pts = [];
+    for (let k = 0; k <= n; k++) {
+      const t = k / n, q = at(t, sag), s = Math.sin(Math.PI * t) * wob * side;
+      pts.push([q[0] - uz * s, q[1], q[2] + ux * s]);
+    }
+    const r0 = lrn(0.05, 0.075), leafP = P.leafy[Math.floor(lr() * 3) % 3], leafL = P.leaf[Math.floor(lr() * 3) % 3], twin = lr() < 0.55;
+    const tw0 = lr() * TAU, vc = LIANA_C[Math.floor(lr() * LIANA_C.length) % LIANA_C.length];
+    for (let k = 0; k < n; k++) {
+      const p = pts[k], q = pts[k + 1];
+      plantStem(lb, p[0], p[1], p[2], q[0], q[1], q[2], r0, r0, vc, 0.3);
+      if (twin) {                                                   // a thinner strand twisting round it
+        const o = (j) => { const a = tw0 + j * 1.9; return [pts[j][0] - uz * Math.cos(a) * r0 * 1.7, pts[j][1] + Math.sin(a) * r0 * 1.7, pts[j][2] + ux * Math.cos(a) * r0 * 1.7]; };
+        const A = o(k), B2 = o(k + 1);
+        plantStem(lb, A[0], A[1], A[2], B2[0], B2[1], B2[2], r0 * 0.45, r0 * 0.45, P.vine, 0.35);
+      }
+      for (let m = 1 + Math.floor(lr() * 2.6); m > 0; m--) {
+        const f = lr(), c = [p[0] + (q[0] - p[0]) * f, p[1] + (q[1] - p[1]) * f, p[2] + (q[2] - p[2]) * f], a = lr() * TAU;
+        plantLeaf(lb, c, Math.cos(a), lrn(-0.9, 0.2), Math.sin(a), lrn(0.3, 0.48), lrn(0.1, 0.15), 0.08, lr() < 0.5 ? leafP : leafL, 0.8);
+      }
+    }
+    for (let m = Math.floor(lr() * 3.4); m > 0; m--) {                // tendrils hanging from it
+      const k = 2 + Math.floor(lr() * (n - 3)), p = pts[k], g = heightAt(p[0], p[2]), hl = Math.min(lrn(0.6, 1.8), p[1] - g - 2.3);
+      if (hl < 0.4) continue;
+      let c = p;
+      for (let j = 1; j <= 3; j++) {
+        const e = [p[0] + lrn(-0.12, 0.12), p[1] - hl * j / 3, p[2] + lrn(-0.12, 0.12)];
+        plantStem(lb, c[0], c[1], c[2], e[0], e[1], e[2], r0 * 0.6, r0 * 0.5, P.vine, 0.5);
+        const a = lr() * TAU;
+        plantLeaf(lb, e, Math.cos(a), -0.3, Math.sin(a), 0.2, 0.07, 0.05, leafP, 0.9);
+        c = e;
+      }
+    }
+    if (lr() < 0.25) {                                                // a flowering one
+      const col = P.bloom[Math.floor(lr() * P.bloom.length) % P.bloom.length];
+      for (let m = 3 + Math.floor(lr() * 3); m > 0; m--) {
+        const p = pts[1 + Math.floor(lr() * (n - 1))], a = lr() * TAU;
+        plantBloom(lb, [p[0], p[1] - 0.06, p[2]], Math.cos(a) * 0.6, -0.5, Math.sin(a) * 0.6, 0.07, col, P.bloom[2]);
+      }
+    }
+    // sway: 0 at the anchors, most in the middle (the tree shader leans by bw.x^2)
+    const v1 = lb.p.length / 3, L2 = (bx - ax) * (bx - ax) + (bz - az) * (bz - az) || 1, amp = 1.2 + sag * 0.45;
+    for (let v = v0; v < v1; v++) {
+      const t = clamp(((lb.p[v * 3] - ax) * (bx - ax) + (lb.p[v * 3 + 2] - az) * (bz - az)) / L2, 0, 1);
+      lb.w[v * 2] = amp * Math.pow(4 * t * (1 - t), 0.7);
+    }
+    LIANAS.push({ a: A, b: B, v0, v1 });
+    return true;
+  }
+  // a tree / palm fell: the vines hung from it drop to the ground (flat on it, still)
+  function lianaCut(kind, id) {
+    if (!lianaMesh) return;
+    const P = lianaMesh.geometry.attributes.position, Bw = lianaMesh.geometry.attributes.bw, a = P.array;
+    let any = false;
+    for (const l of LIANAS) {
+      if (l.down || !((l.a.kind === kind && l.a.id === id) || (l.b.kind === kind && l.b.id === id))) continue;
+      l.down = true; any = true;
+      let lo = 1e9;
+      for (let v = l.v0; v < l.v1; v++) lo = Math.min(lo, a[v * 3 + 1]);
+      for (let v = l.v0; v < l.v1; v++) {
+        const x = a[v * 3], z = a[v * 3 + 2];
+        a[v * 3 + 1] = heightAt(x, z) + 0.04 + (a[v * 3 + 1] - lo) * 0.04;
+        Bw.array[v * 2] = 0; Bw.array[v * 2 + 1] *= 0.3;
+      }
+    }
+    if (any) { P.needsUpdate = true; Bw.needsUpdate = true; lianaMesh.geometry.computeBoundingSphere(); }
+  }
+
+  // ---- ruin debris (own stream): toppled columns (drums in a row, the broken stub on its plinth, the capital
+  // further on), broken wall stubs with their fallen blocks, heaps of carved blocks, a half-buried stone head, and
+  // mossy fallen logs in the woods. Each piece is a boulder-like surface (crawled over / jumped onto / a wall)
+  function natSolid(b, arr, m, pal, seed, rng, jit) {
+    const e = m.elements, v = [0, 0, 0, 0, 0, 0, 0, 0, 0];
+    for (let i = 0; i < arr.length; i += 9) {
+      for (let j = 0; j < 9; j += 3) {
+        const x0 = arr[i + j], y0 = arr[i + j + 1], z0 = arr[i + j + 2];
+        const f = 1 - jit + 2 * jit * hash3(Math.round(x0 * 100), Math.round(y0 * 100), Math.round(z0 * 100), seed);
+        const x = x0 * f, y = y0 * f, z = z0 * f;
+        v[j] = e[0] * x + e[4] * y + e[8] * z + e[12]; v[j + 1] = e[1] * x + e[5] * y + e[9] * z + e[13]; v[j + 2] = e[2] * x + e[6] * y + e[10] * z + e[14];
+      }
+      natFace(b, v, pal[0], pal[1], pal[2], 0.93 + rng() * 0.14);
+    }
+  }
+  function buildRuins(b) {
+    const ru = G.util.rng(((W.seed | 0) ^ 0x1f7e29) >>> 0), rn2 = (a, c) => a + (c - a) * ru();
+    const ST = [[C(0xd2c4a2), C(0xb9aa88), C(0x938668)], [C(0xc6b79a), C(0xab9d80), C(0x877b63)], [C(0xbdb4a4), C(0xa19888), C(0x7d766a)]];
+    const MOSS = [C(0x7f9e4c), C(0xa99c7e), C(0x857a62)];
+    const dark = C(0x4a4238);
+    const piece = (x, z, fn) => {                          // what fn draws becomes one crawl-over / jump-onto surface
+      const ti0 = b.p.length, g = heightAt(x, z);
+      fn();
+      const rk = addRockSurface(b.p, ti0, b.p.length, x, z, g);
+      W.colliders.push({ x, z, r: Math.max(0.3, rk.r * 0.85), y0: g - 1, top: rk.top, kind: 'rock', walk: rk.h <= ROCK_JUMP, rh: rk.h });
+      return rk;
+    };
+    const blk = (x, y, z, sx, sy, sz, ry, rx, rz, pal) => natSolid(b, TPL.box, mTRS(x, y, z, rx || 0, ry || 0, rz || 0, sx, sy, sz), pal, Math.floor(ru() * 1000), ru, 0.07);
+    const drum = (ax, ay, az, bx, by, bz, r, pal) => natSolid(b, TPL.cyl8, mSeg(ax, ay, az, bx, by, bz, r), pal, Math.floor(ru() * 1000), ru, 0.05);
+    const theme = W.layout && W.layout.decor, ruinK = { byzantine: 2, temple: 2, fort: 1.5, statues: 1.5, megalith: 1.3, graveyard: 1.2 }[theme] || 1;
+    const nR = Math.round(4 * AREA * ruinK * (VAR === 'lush' ? 0.8 : 1)), spots = [];
+    for (let tries = 0, n = 0; n < nR && tries < nR * 60; tries++) {
+      const p = bandPt(ru, 7, 1e3);
+      if (!p) continue;
+      const x = p.x, z = p.z, g = heightAt(x, z);
+      if (g < 1 || g > 14 || steepAt(x, z) > 0.45 || !propOK(x, z, 3.2, true) || spots.some((q) => Math.hypot(q[0] - x, q[1] - z) < 12)) continue;
+      spots.push([x, z]); n++;
+      const pal = ST[Math.floor(ru() * 3) % 3], mp = [MOSS[0], pal[1], pal[2]], a = ru() * TAU, ca = Math.cos(a), sa = Math.sin(a);
+      const kind = ru();
+      RUINS.push([+x.toFixed(1), +z.toFixed(1), kind < 0.35 ? 'column' : kind < 0.6 ? 'wall' : kind < 0.85 ? 'blocks' : 'head', +a.toFixed(2)]);
+      if (kind < 0.35) {                                   // toppled column
+        const r = rn2(0.42, 0.6), gl = gLow(x, z, 1.0), sh = rn2(0.7, 2.4);
+        piece(x, z, () => {
+          blk(x, gl + 0.12, z, r * 3, 0.5, r * 3, a, 0, 0, pal);
+          drum(x, gl + 0.3, z, x + rn2(-0.05, 0.05), gl + 0.3 + sh, z + rn2(-0.05, 0.05), r, ru() < 0.4 ? mp : pal);
+          natBlob(b, TPL.ico, mTRS(x, gl + 0.3 + sh, z, ru(), ru() * TAU, ru(), r * 0.9, r * 0.45, r * 0.9), pal[0], pal[1], pal[2], Math.floor(ru() * 1000), ru);
+        });
+        let u = r * 1.6 + rn2(0.3, 0.8);
+        for (let k = 1 + Math.floor(ru() * 3); k > 0; k--) {
+          const Ld = rn2(0.9, 1.3), jx = rn2(-0.3, 0.3), cx = x + ca * (u + Ld / 2) - sa * jx, cz = z + sa * (u + Ld / 2) + ca * jx;
+          const tw = a + rn2(-0.25, 0.25), dx = Math.cos(tw) * Ld / 2, dz = Math.sin(tw) * Ld / 2;
+          const ya = heightAt(cx - dx, cz - dz), yb = heightAt(cx + dx, cz + dz);
+          piece(cx, cz, () => drum(cx - dx, ya + r * 0.8, cz - dz, cx + dx, yb + r * 0.8, cz + dz, r, ru() < 0.35 ? mp : pal));
+          u += Ld + rn2(0.05, 0.6);
+        }
+        const cx = x + ca * (u + 0.8) + sa * rn2(-0.6, 0.6), cz = z + sa * (u + 0.8) - ca * rn2(-0.6, 0.6), gc = gLow(cx, cz, 0.8);
+        piece(cx, cz, () => blk(cx, gc + 0.22, cz, r * 3.1, r * 1.1, r * 3.1, ru() * TAU, rn2(-0.25, 0.25), rn2(-0.25, 0.25), pal));
+      } else if (kind < 0.6) {                             // broken wall stub + fallen blocks
+        const len = rn2(2.6, 4.4), th = rn2(0.6, 0.8), nb = Math.max(2, Math.round(len / 1.05)), bl = len / nb;
+        piece(x, z, () => {
+          for (let i = 0; i < nb; i++) {
+            const u = -len / 2 + (i + 0.5) * bl, px = x + ca * u, pz = z + sa * u, gp = gLow(px, pz, bl * 0.6) - 0.15;
+            const courses = 1 + Math.floor(ru() * (i === 0 || i === nb - 1 ? 2 : 4));
+            for (let k = 0; k < courses; k++) blk(px, gp + 0.25 + k * 0.48, pz, bl * 0.97, 0.47, th * rn2(0.92, 1.05), -a + rn2(-0.04, 0.04), 0, 0, k === courses - 1 && ru() < 0.4 ? mp : pal);
+          }
+        });
+        for (let k = 2 + Math.floor(ru() * 4); k > 0; k--) {
+          const u = rn2(-len / 2, len / 2), w = (ru() < 0.5 ? -1 : 1) * rn2(0.9, 2.2), px = x + ca * u - sa * w, pz = z + sa * u + ca * w;
+          if (!propOK(px, pz, 0.3, false) && ru() < 0.7) continue;
+          const gp = gLow(px, pz, 0.5);
+          piece(px, pz, () => blk(px, gp + 0.16, pz, bl * rn2(0.7, 1), 0.47, th * rn2(0.8, 1), ru() * TAU, rn2(-0.3, 0.3), rn2(-0.3, 0.3), ru() < 0.3 ? mp : pal));
+        }
+      } else if (kind < 0.85) {                            // heap of carved blocks
+        for (let k = 3 + Math.floor(ru() * 5); k > 0; k--) {
+          const d = rn2(0, 2.2), b2 = ru() * TAU, px = x + Math.cos(b2) * d, pz = z + Math.sin(b2) * d, sz = rn2(0.55, 1.05), gp = gLow(px, pz, sz * 0.6);
+          piece(px, pz, () => {
+            blk(px, gp + sz * 0.3, pz, sz * rn2(1, 1.6), sz * 0.8, sz, ru() * TAU, rn2(-0.2, 0.2), rn2(-0.2, 0.2), pal);
+            if (ru() < 0.35) blk(px + rn2(-0.15, 0.15), gp + sz * 0.95, pz + rn2(-0.15, 0.15), sz * 0.8, sz * 0.6, sz * 0.75, ru() * TAU, rn2(-0.15, 0.15), 0, ru() < 0.5 ? mp : pal);
+          });
+        }
+      } else {                                             // half-buried stone head (a moai): heavy brow, long nose, lips, ears
+        const sc = rn2(1.0, 1.45), gh = gLow(x, z, sc) - sc * 0.55, F = new T.Matrix4().copy(mTRS(x, gh, z, rn2(-0.4, 0.05), a, rn2(-0.25, 0.25), 1, 1, 1));
+        const e = new T.Euler().setFromRotationMatrix(F), v3 = new T.Vector3();
+        const part = (u, v, w, sx, sy, sz, pl, jit) => {
+          v3.set(u * sc, v * sc, w * sc).applyMatrix4(F);
+          natSolid(b, TPL.box, mTRS(v3.x, v3.y, v3.z, e.x, e.y, e.z, sx * sc, sy * sc, sz * sc), pl, Math.floor(ru() * 1000), ru, jit);
+        };
+        piece(x, z, () => {
+          part(0, 1.0, 0, 1.3, 2.0, 1.15, ru() < 0.5 ? mp : pal, 0.06);          // the head
+          part(0, 1.62, 0.5, 1.36, 0.3, 0.42, pal, 0.05);                          // brow
+          part(0, 1.12, 0.66, 0.34, 0.85, 0.42, pal, 0.05);                        // nose
+          part(0, 0.56, 0.58, 0.72, 0.17, 0.28, pal, 0.04);                        // lips
+          part(0, 0.3, 0.46, 0.8, 0.34, 0.32, pal, 0.05);                          // chin
+          for (const sd of [-1, 1]) part(sd * 0.7, 1.12, -0.05, 0.18, 0.8, 0.36, pal, 0.05);   // ears
+          for (const sd of [-1, 1]) {                                              // dark eye hollows under the brow
+            v3.set(sd * 0.34 * sc, 1.36 * sc, 0.55 * sc).applyMatrix4(F);
+            b.add(TPL.box, mTRS(v3.x, v3.y, v3.z, e.x, e.y, e.z, 0.3 * sc, 0.16 * sc, 0.12 * sc), dark, 0.05, ru);
+          }
+        });
+        if (ru() < 0.4) {                                  // its red stone topknot, fallen beside it
+          const px = x + Math.cos(a + 1.9) * sc * 2.2, pz = z + Math.sin(a + 1.9) * sc * 2.2, gp = gLow(px, pz, 0.7 * sc), red = [C(0xa4604a), C(0x8a4c3a), C(0x6c3a2e)];
+          piece(px, pz, () => natSolid(b, TPL.cyl8, mTRS(px, gp + 0.42 * sc, pz, Math.PI / 2 + rn2(-0.2, 0.2), ru() * TAU, 0, 0.62 * sc, 0.8 * sc, 0.62 * sc), red, Math.floor(ru() * 1000), ru, 0.05));
+        }
+      }
+    }
+    // mossy fallen logs in the woods: bark, a moss back, a root knot, bracket fungi
+    const bark = [C(0x6f5a40), C(0x5a4834), C(0x463828)], moss = [C(0x6f9a3e), C(0x5a4834), C(0x463828)], fungi = [C(0xe8d2a0), C(0xd7874a)];
+    const tl = W.trees || [], nL = Math.round(3 * AREA * (VAR === 'lush' ? 1.6 : VAR === 'rocky' ? 0.5 : 1));
+    for (let tries = 0, n = 0; n < nL && tries < nL * 40; tries++) {
+      let x, z;
+      if (tl.length && ru() < 0.7) { const t = tl[Math.floor(ru() * tl.length) % tl.length], a = ru() * TAU, d = rn2(3, 6.5); x = t.x + Math.cos(a) * d; z = t.z + Math.sin(a) * d; }
+      else if (GROVES.length) { const gv = GROVES[Math.floor(ru() * GROVES.length) % GROVES.length], a = ru() * TAU, d = Math.sqrt(ru()) * gv.r; x = gv.x + Math.cos(a) * d; z = gv.z + Math.sin(a) * d; }
+      else continue;
+      const g = heightAt(x, z);
+      if (g < 1.1 || steepAt(x, z) > 0.55 || !propOK(x, z, 1.8, true)) continue;
+      const ya = ru() * TAU, L = rn2(2.8, 5.2), r = rn2(0.26, 0.42), dx = Math.cos(ya) * L / 2, dz = Math.sin(ya) * L / 2;
+      const ax = x - dx, az = z - dz, bx = x + dx, bz = z + dz, ya0 = heightAt(ax, az) + r * 0.75, yb0 = heightAt(bx, bz) + r * 0.75;
+      piece(x, z, () => {
+        natSolid(b, TPL.cyl8, mSeg(ax, ya0, az, bx, yb0, bz, r), bark, Math.floor(ru() * 1000), ru, 0.08);
+        natBlob(b, TPL.ico, mTRS(ax, ya0, az, ru(), ru() * TAU, ru(), r * 1.5, r * 1.3, r * 1.5), bark[0], bark[1], bark[2], Math.floor(ru() * 1000), ru);
+        for (let k = 0; k < 3; k++) {                       // moss on its back
+          const t = 0.2 + k * 0.3 + rn2(-0.08, 0.08), px = ax + (bx - ax) * t, pz = az + (bz - az) * t, py = ya0 + (yb0 - ya0) * t + r * 0.72;
+          natBlob(b, TPL.ico, mTRS(px, py, pz, 0, ya, 0, L * 0.14, r * 0.34, r * 0.72), moss[0], moss[0], moss[1], Math.floor(ru() * 1000), ru);
+        }
+      });
+      for (let k = Math.floor(ru() * 4); k > 0; k--) {       // bracket fungi on its side
+        const t = rn2(0.15, 0.85), sd = ru() < 0.5 ? -1 : 1, px = ax + (bx - ax) * t - Math.sin(ya) * r * sd * 0.95, pz = az + (bz - az) * t + Math.cos(ya) * r * sd * 0.95;
+        const py = ya0 + (yb0 - ya0) * t + rn2(-0.1, 0.15);
+        b.add(TPL.cyl8, mTRS(px, py, pz, 0, ya, 0, rn2(0.09, 0.15), 0.035, rn2(0.07, 0.11)), fungi[k & 1], 0.1, ru);
+      }
+      RUINS.push([+x.toFixed(1), +z.toFixed(1), 'log']);
+      n++;
+    }
+  }
+
+  // ---- beach bits (own stream): shells and starfish on the sand, wet seaweed along the tide line (flat, no collision)
+  function buildBeachBits(b, upTri) {
+    const bb = G.util.rng(((W.seed | 0) ^ 0x2d5a91) >>> 0), bn = (a, c) => a + (c - a) * bb();
+    const SHELL = [C(0xf2e6d2), C(0xf0c8b4), C(0xe8d8b8), C(0xd9b89a)], STAR = [C(0xe8743a), C(0xd8503c), C(0xb85a8a), C(0xe8a63a)];
+    const WEED = [C(0x4f5a2a), C(0x5e5230), C(0x3f4a26)];
+    const sandAt = (x, z, lo, hi) => { const g = heightAt(x, z); return g > lo && g < hi && steepAt(x, z) < 0.5 && !blocked(x, z, 0.3) && propOK(x, z, 0.1, false) ? g : null; };
+    const oct = TPL.n_octa || (TPL.n_octa = tpl(new T.OctahedronGeometry(1, 0)));
+    for (let tries = 0, n = 0, want = Math.round(34 * AREA); n < want && tries < want * 12; tries++) {      // shells
+      const p = bandPt(bb, 0.3, 4); if (!p) continue;
+      const g = sandAt(p.x, p.z, 0.08, 1.3); if (g == null) continue;
+      const s = bn(0.06, 0.13), col = SHELL[Math.floor(bb() * 4) % 4];
+      if (bb() < 0.55) b.add(oct, mTRS(p.x, g + s * 0.25, p.z, bn(-0.3, 0.3), bb() * TAU, 0, s, s * 0.5, s * 1.3), col, 0.12, bb);   // a cockle
+      else b.add(TPL.cyl8, mTRS(p.x, g + s * 0.3, p.z, Math.PI / 2 + bn(-0.3, 0.3), bb() * TAU, 0, s * 0.45, s * 1.8, s * 0.45), col, 0.12, bb);   // a conch
+      n++;
+    }
+    for (let tries = 0, n = 0, want = Math.round(9 * AREA); n < want && tries < want * 15; tries++) {        // starfish
+      const p = bandPt(bb, -0.3, 2); if (!p) continue;
+      const g = sandAt(p.x, p.z, -0.25, 0.6); if (g == null) continue;
+      const r = bn(0.12, 0.22), col = STAR[Math.floor(bb() * 4) % 4], a0 = bb() * TAU, y = g + 0.025;
+      for (let i = 0; i < 5; i++) {
+        const a = a0 + i / 5 * TAU, t = [p.x + Math.cos(a) * r, y, p.z + Math.sin(a) * r];
+        const l = [p.x + Math.cos(a - 0.62) * r * 0.32, y + 0.01, p.z + Math.sin(a - 0.62) * r * 0.32], rr = [p.x + Math.cos(a + 0.62) * r * 0.32, y + 0.01, p.z + Math.sin(a + 0.62) * r * 0.32];
+        upTri([p.x, y + 0.02, p.z], l, t, col, 1); upTri([p.x, y + 0.02, p.z], t, rr, col, 0.9);
+      }
+      n++;
+    }
+    for (let tries = 0, n = 0, want = Math.round(12 * AREA); n < want && tries < want * 12; tries++) {       // seaweed on the tide line
+      const p = bandPt(bb, 0.2, 1.6); if (!p) continue;
+      const g = sandAt(p.x, p.z, 0.15, 0.85); if (g == null) continue;
+      const ya = seaYaw(p.x, p.z) + Math.PI / 2;
+      for (let k = 3 + Math.floor(bb() * 5); k > 0; k--) {
+        const a = ya + bn(-0.7, 0.7), L = bn(0.35, 0.9), w = bn(0.04, 0.08), ox = p.x + bn(-0.5, 0.5), oz = p.z + bn(-0.5, 0.5), col = WEED[Math.floor(bb() * 3) % 3];
+        let px = ox, pz = oz, ang = a;
+        for (let s2 = 0; s2 < 3; s2++) {                    // a wavy ribbon in 3 bits
+          const qx = px + Math.cos(ang) * L / 3, qz = pz + Math.sin(ang) * L / 3, nx = -Math.sin(ang) * w, nz = Math.cos(ang) * w;
+          const y0 = heightAt(px, pz) + 0.02, y1 = heightAt(qx, qz) + 0.02;
+          upTri([px - nx, y0, pz - nz], [qx - nx, y1, qz - nz], [qx + nx, y1, qz + nz], col, 1);
+          upTri([px - nx, y0, pz - nz], [qx + nx, y1, qz + nz], [px + nx, y0, pz + nz], col, 0.92);
+          px = qx; pz = qz; ang += bn(-0.6, 0.6);
+        }
+      }
+      n++;
+    }
   }
 
   // ---------------------------------------------------------------- contact shadows (baked ground occlusion)
@@ -4686,13 +5043,15 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
   // the same wave, so a gust visibly sweeps through both. windGust 0.1..1, windFlutter -1..1 (fast shiver)
   function windGust(x, z, t) { return 0.55 + 0.45 * Math.sin(t * 1.25 - (x * WX + z * WZ) * 0.09); }
   function windFlutter(x, z, t) { return Math.sin(t * 3.3 - (x * WX + z * WZ) * 0.35 + x * 0.7 + z * 0.4); }
-  // walkers push grass / bushes aside: uPush[i] = (x, z, radius, strength), filled in W.update (the nearest 8)
+  // walkers push grass / bushes aside: uPush[i] = (x, z, feet y, strength), filled in W.update (the nearest 8); 1 m
+  // round them, only the leaves from just below the feet to the chest (not a crown overhead, not a bush up on a ledge)
   const PUSH_GLSL = (h, side, down) =>
     '  for ( int i = 0; i < 8; i++ ) {\n' +
     '    vec4 pu = uPush[i];\n' +
     '    if ( pu.w <= 0.0 ) continue;\n' +
     '    vec2 pd = transformed.xz - pu.xy; float pl = length( pd );\n' +
-    '    float pk = pu.w * ' + h + ' * ( 1.0 - smoothstep( pu.z * 0.35, pu.z, pl ) );\n' +
+    '    float py = transformed.y - pu.z;\n' +
+    '    float pk = pu.w * ' + h + ' * ( 1.0 - smoothstep( 0.35, 1.0, pl ) ) * smoothstep( -0.8, -0.3, py ) * ( 1.0 - smoothstep( 1.2, 2.2, py ) );\n' +
     '    transformed.xz += pd / max( pl, 0.05 ) * pk * ' + side + ';\n' +
     '    transformed.y -= pk * ' + down + ';\n' +
     '  }\n';
@@ -4958,7 +5317,7 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
       sh.vertexShader.replace('#include <begin_vertex>', '#include <begin_vertex>\n' + PLANT_GLSL);
   }
   function pushU() {
-    if (!PUSH) { PUSH = { value: [] }; for (let i = 0; i < 8; i++) PUSH.value.push(new T.Vector4(0, 0, 1, 0)); }
+    if (!PUSH) { PUSH = { value: [] }; for (let i = 0; i < 8; i++) PUSH.value.push(new T.Vector4(0, 0, 0, 0)); }
     return PUSH;
   }
   let PR = Math.random, PPAL = null;                  // PR: the current plant's own stream
@@ -6492,7 +6851,7 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
       if (!best) continue;
       const tw = { x: tp.x, z: tp.z, c: best.c, s: best.s, hx: TW_H, hz: TW_H, y,
                    ramp: { tx: best.tx, tz: best.tz, ty: y, bx: best.bx, bz: best.bz, by: best.by, ux: best.ux, uz: best.uz, len: best.len } };
-      TOWERS.push(tw);
+      TOWERS.push(tw); tw.sides = [];
       const toW = (lx, lz) => [tp.x + lx * best.c + lz * best.s, tp.z - lx * best.s + lz * best.c];
       // posts (to the roof), platform, railings (open on the ramp side), thatched roof
       const P0 = TW_H - 0.15;
@@ -6548,8 +6907,23 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
           R2.tx + ux * t + nx * 0.013, R2.ty + uy * t + ny * 0.013, R2.tz + uz * t + nz * 0.013), cDark, 0.04, rng);
       }
       boxes.push({ x: tp.x, z: tp.z, c: best.c, s: best.s, hx: TW_H, hz: TW_H, cy0: 0, cy1: 0, ry0: y - 0.25, ry1: y, solid: false, ray: true });
+      // the ramp's sides: solid in 0.5 m pieces wherever its board is more than a step up (0.7 m: W.surface) over the
+      // ground — one on foot beside or under it is stopped (no walking through it at shoulder height); on the board the
+      // feet are above each piece's top. So it is only boarded where it comes down to knee height, and at its foot
+      for (let a0 = 0; a0 < R2.len - 0.01; a0 += 0.5) {
+        const a1 = Math.min(R2.len, a0 + 0.5), lo = y + (R2.by - y) * (a1 / R2.len), am = (a0 + a1) / 2;
+        let gmx = -1e9;
+        for (const u of [a0, am, a1]) for (const w of [-RAMP_HALF, 0, RAMP_HALF]) gmx = Math.max(gmx, heightAt(R2.tx + R2.ux * u + R2.uz * w, R2.tz + R2.uz * u - R2.ux * w));
+        const cy1 = lo - 0.72;
+        if (cy1 <= gmx) continue;
+        boxes.push({ x: R2.tx + R2.ux * am, z: R2.tz + R2.uz * am, c: best.c, s: best.s, hx: (a1 - a0) / 2, hz: RAMP_HALF,
+          cy0: gmx - 3, cy1, ry0: 0, ry1: 0, solid: true, ray: false, ramp: true });
+        tw.sides.push(boxes[boxes.length - 1]);                   // (bot nav mask: decoMask)
+      }
     }
   }
+  // on / by a watchtower (its platform or ramp, m metres of margin)?
+  W.onTower = function (x, z, m) { return onTower(x, z, m || 0); };
   function onTower(x, z, m) {
     for (const tw of TOWERS) {
       if (Math.hypot(x - tw.x, z - tw.z) < TW_H * 1.5 + m) return true;
@@ -6840,7 +7214,61 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
     if (ARCH && Math.hypot(x - ARCH.x, z - ARCH.z) < ARCH.span + rad + 4) return false;
     if (LAGOON && Math.hypot(x - LAGOON.x, z - LAGOON.z) < LAGOON.r + rad + 2) return false;
     for (const d of DECO) if (Math.hypot(x - d.x, z - d.z) < d.r + rad + 5) return false;
+    if (GIANT) for (const p of GIANT.pts) if (Math.hypot(x - p[0], z - p[1]) < rad + (p[2] > 0.27 && p[2] < 0.63 ? 8 : 4.5)) return false;
     return true;
+  }
+  // ---- the giant: one colossal fossil skeleton lying across the island (model: decor_g.js, G.decor.giantLine). Its
+  // spine must stay on dry land (the tail tip may reach the shallows), clear of the camp, the landings, towers,
+  // bridges, pads, the wreck, the arch, the lagoon, caves and rivers, with the ribcage and the skull on fairly level
+  // ground (and preferably off the walking lanes). Planned first: planDecor puts it in DECO before the others
+  let GIANT = null;
+  function giantClear(x, z, rad) {
+    if (campDist(x, z) < 15 + rad || Math.hypot(x, z) > RX + 10 || narrowD(x, z) < rad + 3 || caveArea(x, z)) return false;
+    for (const si of SI) {
+      const lx = x - si.bx, lz = z - si.bz, along = lx * si.dx + lz * si.dz, lat = -lx * si.dz + lz * si.dx;
+      if (Math.abs(lat) < 7 + rad && Math.abs(along) < 20 + rad) return false;
+      if (Math.hypot(x - si.x, z - si.z) < 19 + rad) return false;
+    }
+    for (const t of TPLAN) if (Math.hypot(x - t.x, z - t.z) < rad + 10) return false;
+    for (const p of PADS) if (Math.hypot(x - p.x, z - p.z) < p.r + rad + 2) return false;
+    for (const br of BRIDGES) if (segDist(x, z, br.ax, br.az, br.bx, br.bz) < rad + 3) return false;
+    if (WRECK && Math.hypot(x - WRECK.x, z - WRECK.z) < rad + 12) return false;
+    if (ARCH && Math.hypot(x - ARCH.x, z - ARCH.z) < ARCH.span + rad + 4) return false;
+    if (LAGOON && Math.hypot(x - LAGOON.x, z - LAGOON.z) < LAGOON.r + rad + 2) return false;
+    return true;
+  }
+  function planGiant() {
+    GIANT = null;
+    const DC = G.decor;
+    if (!DC || !DC.TYPES || !DC.TYPES.giant || !DC.giantLine) return;
+    const f = W.forceDecor || urlParam('decor');
+    if (urlParam('giant') === '0' || f === 'none' || f === '0') return;
+    const r = G.util.rng(((W.seed + 3) * 69621 + 7) >>> 0), rn = (a, b) => a + (b - a) * r();
+    const L0 = clamp(RX * rn(0.62, 0.8), 40, 64);
+    let best = null, bs = -1e9;
+    // (no room for it: once more, a smaller one — 3 in 4 of that size — on less level ground)
+    for (let tries = 0; tries < 700; tries++) {
+      if (tries === 420 && best) break;
+      const small = tries >= 420, L = small ? Math.max(32, L0 * 0.75) : L0, s = L / 56, tol = small ? 1.4 : 1;
+      const a = r() * TAU, rr = Math.sqrt(r()) * RX * 0.5, cx = Math.cos(a) * rr, cz = Math.sin(a) * rr, yaw = r() * TAU;
+      const bend = rn(-1, 1), curl = rn(-1, 1), c = Math.cos(yaw), sn = Math.sin(yaw), pts = [];
+      let ok = true, lo = 1e9, hi = -1e9, slo = 1e9, shi = -1e9, lane = 0;
+      for (let k = 0; k <= 32 && ok; k++) {
+        const t = k / 32, q = DC.giantLine(L, bend, curl, t), cage = t > 0.27 && t < 0.63, head = t < 0.16;
+        const wide = cage ? 6.2 * s : head ? 3.2 * s : 1.6 * s;
+        for (const off of cage || head ? [-1, -0.5, 0, 0.5, 1] : [-1, 0, 1]) {
+          const lx = q[0] + off * wide, lz = q[1], x = cx + lx * c + lz * sn, z = cz - lx * sn + lz * c, h = heightRaw(x, z);
+          if (h < (t > 0.86 ? -0.5 : 0.75) || h > 16 || !giantClear(x, z, off ? 0.5 : 1.5)) { ok = false; break; }
+          if (cage) { if (h < lo) lo = h; if (h > hi) hi = h; if (routeDist(x, z) < 3) lane++; }
+          if (head) { if (h < slo) slo = h; if (h > shi) shi = h; }
+        }
+        pts.push([cx + q[0] * c + q[1] * sn, cz - q[0] * sn + q[1] * c, t]);
+      }
+      if (!ok || hi - lo > (2.6 * s + 0.6) * tol || shi - slo > 2 * tol) continue;
+      const sc = -(hi - lo) * 2 - (shi - slo) - lane * 0.6 - rr * 0.04 + r() * 1.5;
+      if (sc > bs) { bs = sc; best = { x: cx, z: cz, yaw, bend, curl, L, pts, seed: Math.floor(r() * 1e9) }; }
+    }
+    GIANT = best;
   }
   // where: inland | high (prefers height) | beach (sand band) | shore (waterline) | sea (half sunk);
   // face: camp | sea | coast (along the shore) | rand
@@ -6897,10 +7325,12 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
     if (!DC || !DC.order || !DC.order.length) return;
     const f = W.forceDecor || urlParam('decor');        // debug: force the theme (id) or 'none'
     if (f === 'none' || f === '0') return;
+    if (GIANT) DECO.push({ type: 'giant', v: 0, x: GIANT.x, z: GIANT.z, y: heightRaw(GIANT.x, GIANT.z), yaw: GIANT.yaw, r: 6, pad: false,
+      seed: GIANT.seed, opt: { L: GIANT.L, bend: GIANT.bend, curl: GIANT.curl } });
     const r = G.util.rng(((W.seed + 1) * 48271 + 911) >>> 0), rn = (a, b) => a + (b - a) * r();
     const shuf = (a) => { for (let i = a.length - 1; i > 0; i--) { const j = Math.floor(r() * (i + 1)); const t = a[i]; a[i] = a[j]; a[j] = t; } return a; };
     const vars = (id) => shuf(DC.TYPES[id].list.map((_, i) => i));
-    const ids = DC.order.slice(), theme = f && DC.TYPES[f] ? f : ids[Math.floor(r() * ids.length) % ids.length];
+    const ids = DC.order.filter((id) => !DC.TYPES[id].solo), theme = f && DC.TYPES[f] && !DC.TYPES[f].solo ? f : ids[Math.floor(r() * ids.length) % ids.length];
     const nTheme = 5 + (r() < 0.5 ? 1 : 0), total = nTheme + 4 + (r() < 0.5 ? 1 : 0);   // half the pieces: the theme
     const tv = vars(theme), want = [], used = {};
     for (let i = 0; i < nTheme; i++) want.push({ type: theme, pref: tv[i % tv.length], th: 1 });
@@ -6919,7 +7349,7 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
         for (let k = 0; k < Math.min(w.th ? 10 : 5, order.length); k++) if (placeDeco(type, order[k], r, rn)) { u.add(order[k]); ok = true; break; }
       }
     }
-    W.layout.decor = theme; W.layout.decorName = DC.TYPES[theme].name; W.layout.decorN = DECO.length;
+    W.layout.decor = theme; W.layout.decorName = DC.TYPES[theme].name; W.layout.decorN = DECO.length; W.layout.fossil = !!GIANT;
   }
   // one set piece: G.decor builds it into local batches through D; geometry + collision -> world
   function buildDecoItem(it, b, b2, wt, gal) {
@@ -6928,12 +7358,13 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
     const WX = (lx, lz) => ox + lx * c + lz * s, WZ = (lx, lz) => oz - lx * s + lz * c;
     const bx = [], cy = [], tops = [], keeps = [], surfs = [];
     const D = {
-      b: new Batch(), b2: new Batch(), rng: G.util.rng((it.seed >>> 0) || 1), v: it.v, type: it.type, r: it.r, K: W._kit(),
+      b: new Batch(), b2: new Batch(), rng: G.util.rng((it.seed >>> 0) || 1), v: it.v, type: it.type, r: it.r, K: W._kit(), opt: it.opt || null,
       g: gal ? () => 0 : (lx, lz) => heightAt(WX(lx, lz), WZ(lx, lz)) - oy,
       water: gal ? -50 : (G.CFG.WATER_Y || 0) - oy,
       // oriented box (local centre, yaw, half extents, y range): blocks walkers (unless rayOnly) and bullets
       solid(lx, lz, yaw, hx, hz, y0, y1, rayOnly) { bx.push([lx, lz, yaw || 0, hx, hz, y0, y1, !!rayOnly]); },
-      col(lx, lz, r, y0, y1) { cy.push([lx, lz, r, y0, y1]); },
+      // (thin: a slim post / bone - the bots' nav mask grows it by less, so they fit between a row of them)
+      col(lx, lz, r, y0, y1, thin) { cy.push([lx, lz, r, y0, y1, !!thin]); },
       // walkable flat top / ramp (a to b, half width hw), local coordinates
       walk(lx, lz, yaw, hx, hz, y) {
         const cs = Math.cos(yaw || 0), sn = Math.sin(yaw || 0), P = [];
@@ -6976,14 +7407,15 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
       const x = WX(q[0], q[1]), z = WZ(q[0], q[1]), yw = it.yaw + q[2], bc = Math.cos(yw), bs = Math.sin(yw);
       // cy0 a bit below the box: a solid standing on a walkable top must still stop the walker on that top
       boxes.push({ x, z, c: bc, s: bs, hx: q[3], hz: q[4], cy0: oy + q[5] - 0.35, cy1: oy + q[6], ry0: oy + q[5], ry1: oy + q[6], solid: !q[7], ray: true, deco: true });
-      const o = { x, z, c: bc, s: bs, hx: q[3], hz: q[4] };
+      const o = { x, z, c: bc, s: bs, hx: q[3], hz: q[4] }, gl = heightAt(x, z) - oy;   // (the ground there: a big piece spans slopes)
       DOBS.push(o);
-      if (!q[7] && q[5] < 0.9 && q[6] > 0.6) NOBS.push(o);
+      if (!q[7] && q[5] < gl + 0.9 && q[6] > gl + 0.6) NOBS.push(o);
     }
     for (const q of cy) {
       const x = WX(q[0], q[1]), z = WZ(q[0], q[1]);
       W.colliders.push({ x, z, r: q[2], y0: oy + q[3], top: oy + q[4], kind: 'deco' });
-      if (q[3] < 0.9 && q[4] > 0.6) NOBS.push({ x, z, r: q[2] });
+      const gl = heightAt(x, z) - oy;
+      if (q[3] < gl + 0.9 && q[4] > gl + 0.6) NOBS.push(q[5] ? { x, z, r: q[2], e: 0.2, e2: 0.15 } : { x, z, r: q[2] });
     }
     for (const P of tops) {
       const i0 = wt.length, Q = P.map((p) => [WX(p[0], p[2]), oy + p[1], WZ(p[0], p[2])]);
@@ -7037,6 +7469,8 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
       const thin = c.kind === 'palm' || c.kind === 'tree' || c.kind === 'post' || c.kind === 'torch';
       L.push({ x: c.x, z: c.z, r: c.r, e: thin ? 0.2 : 0.45, e2: thin ? 0.15 : 0.32 });
     }
+    // the raised part of a watchtower ramp (its solid sides): bots walk round it, never into its side
+    for (const tw of TOWERS) for (const q of tw.sides || []) L.push({ x: q.x, z: q.z, c: q.c, s: q.s, hx: q.hx, hz: q.hz });
     if (!L.length) return;
     DMX = X0; DMN = Math.ceil(-2 * X0 / DM_C);
     DMASK = new Uint8Array(DMN * DMN);
@@ -7437,6 +7871,7 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
                  giant: MTS.some((m) => m.giant), twinPeaks: MTS.filter((m) => m.child).length, mesa: MTS.some((m) => m.mesa),
                  cliffs: MTS.filter((m) => m.ck > 0 && !m.mesa).length, overhangs: NOTCHES.length, bridges: BRIDGES.length,
                  seaCliffs: CCLIFFS.length, wreck: !!WRECK, arch: !!ARCH, ladders: 0 };
+    planGiant();                                   // the fossil giant across the island (before the other set pieces)
     planDecor();                                   // set-piece sites (+ their terrain pads, used by the grid below)
     // a cave corridor whose mouth opens onto higher ground ramps its floor up to it over the last metres (see caveFloor)
     for (const cv of CAVES) {
@@ -7587,7 +8022,7 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
     buildContactAO(aoSrc);
     // every other world mesh: split each triangle into DET^2 (terrain, water, sky, sails are built at that density)
     if (DET > 1) {
-      const skip = { terrain: 1, caveCeiling: 1, water: 1, foam: 1, sky: 1, sails: 1, palmTrunks: 1, breakables: 1, cover: 1 };
+      const skip = { terrain: 1, caveCeiling: 1, water: 1, foam: 1, sky: 1, sails: 1, palmTrunks: 1, breakables: 1, cover: 1, lianas: 1 };
       W.group.traverse((o) => { if (o.isMesh && !skip[o.name]) G.detailize(o, true); });
     }
     // weather: which world materials take snow (G.weather.inject reads userData at compile time)
@@ -7629,6 +8064,7 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
     W.built = false;
     boxes = []; palms = []; sails = []; SI = []; anch = []; hills = []; fallen = []; trunks = null; PTB = null; RAY_COL = null;
     BKB = null; brkMesh = null; BRK = []; TGP = []; COV = []; W.trees = []; rustleT = new WeakMap(); treeMesh = null; treeTris = 0; treeFellMat = null;
+    lianaMesh = null; LIANAS = []; RUINS = [];
     water = null; waterAmp = null; waterT = null; foam = null; sky = null; clouds = null; crowns = null; fire = null; fireLight = null;
     H = null; HL = null; LID = null; CL = null; CAVES = []; TOWERS = []; TPLAN = []; MTS = []; GROVES = []; LAGOON = null; RIDGE = null;
     BRIDGES = []; PADS = []; LADDERS = []; LREQ = []; NOTCHES = []; CCLIFFS = []; WRECK = null; ARCH = null; NAV = null;
@@ -7724,10 +8160,10 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
       near.sort((x, y) => x[0] - y[0]);
       for (; n < 8 && n < near.length; n++) {
         const a = near[n][1];
-        pv[n].set(a.pos.x, a.pos.z, 1.0, 1);
+        pv[n].set(a.pos.x, a.pos.z, a.pos.y, 1);
         const sp = a.vel ? Math.hypot(a.vel.x, a.vel.z) : 0;
         if (sp > 1.2 && near[n][0] < 30 && G.sfx && simT - (rustleT.get(a) || -9) > 0.38 && inPlants(a.pos.x, a.pos.z, a.pos.y)) {
-          rustleT.set(a, simT); G.sfx.play('rustle', a.pos);
+          rustleT.set(a, simT); G.sfx.play('rustle', a.pos, { k: Math.min(1.1, 0.45 + sp * 0.12) });
         }
       }
       for (; n < 8; n++) pv[n].w = 0;
@@ -7807,6 +8243,8 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
     G.emit('prop:break', { id, kind: k.kind, x: k.x, y: k.g + h * 0.5, z: k.z, by: by || null });
     return true;
   };
+  // debug: the new scenery (lianas [ax, az, bx, bz], ruin clusters / logs [x, z, kind])
+  W.scenery = function () { return { lianas: LIANAS.map((l) => [+l.a.x.toFixed(1), +l.a.z.toFixed(1), +l.b.x.toFixed(1), +l.b.z.toFixed(1), l.down ? 1 : 0]), ruins: RUINS.slice() }; };
   W.grassPatches = function () { return TGP.map((q) => ({ x: q.x, z: q.z, r: q.r })); };   // debug: tall grass patches
   W.props = function () { return BRK.map((k) => ({ id: k.id, kind: k.kind, x: +k.x.toFixed(2), z: +k.z.toFixed(2), hp: k.hp, dead: k.dead })); };
 
@@ -8600,6 +9038,24 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
       f.thud = true;
       if (G.sfx && G.sfx.play) { _p.set(P.x, gy, P.z); G.sfx.play('thud', _p); }
       if (G.fx && G.fx.dust) { _p.set(P.x, gy - r + 0.1, P.z); G.fx.dust(_p, heightAt(P.x, P.z) < 1.8 ? 'sand' : 'dirt'); }
+      if (f.crown) crownSplash(f, P.x, gy - r, P.z);
+    }
+  }
+  // a crown landing hits whoever stands round it like the trunk does (half their full health, once each, weapon
+  // 'tree') and sends a ring of dust over the ground
+  function crownSplash(f, x, y, z) {
+    const R = clamp(f.rT * 1.6 + 1.2, 2.5, 4.5), AL = G.actors && G.actors.list, Cb = G.combat;   // (a palm 2.5 m, a big tree up to 4.5 m)
+    const kind = heightAt(x, z) < 1.8 ? 'sand' : 'dirt';
+    if (G.fx && G.fx.shock) { _p.set(x, y, z); G.fx.shock(_p, R, kind); }
+    if (!AL || !Cb || !Cb.damage) return;
+    for (let i = 0; i < AL.length; i++) {
+      const a = AL[i];
+      if (!a || !a.alive || !a.pos || f.hurt.has(a)) continue;
+      const dx = a.pos.x - x, dz = a.pos.z - z, d = Math.hypot(dx, dz);
+      if (d > R + 0.3 || Math.abs(a.pos.y - y) > 2) continue;
+      f.hurt.add(a);
+      if (a.vel && d > 0.05) { a.vel.x += dx / d * 3; a.vel.z += dz / d * 3; }
+      Cb.damage(a, (a.maxHp || 100) * 0.5, null, 'tree', new T.Vector3(a.pos.x, a.pos.y + 1, a.pos.z));
     }
   }
   function stepFallen(f, dt) {
@@ -8646,6 +9102,7 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
     p.hitT = simT;
     if (--p.hp > 0) return false;
     fellPalm(p, point, dir);
+    lianaCut('palm', id);
     if (G.emit) G.emit('palm:fall', { id, x: p.x, z: p.z, by: by || null });
     return true;
   };
@@ -8801,6 +9258,7 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
       return false;
     }
     fellTree(t, point, dir);
+    lianaCut('tree', id);
     if (G.emit) G.emit('tree:fall', { id, x: t.x, z: t.z, by: by || null });
     return true;
   };
@@ -11239,6 +11697,212 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
 })();
 
 </script>
+<script>/* src/decor_g.js */
+/* decor_g.js — the giant: one colossal fossil skeleton lying across the island. A dragon-like skull with its jaws open
+   on the ground, the neck rising to a ribcage you walk through under a sail-backed spine (8 m up), the hips on legs
+   folded into the ground, the forelimbs' claws, and the tail sinking into the ground in humps. Not a theme piece:
+   world.js plans it first (planGiant: a clear stretch across the island) and builds it like one; the spine line is
+   shared (G.decor.giantLine) so the planner tests exactly what gets built. D.opt = {L (length), bend (neck sway),
+   curl (tail sway)}. Kit + D contract: decor.js */
+(function () {
+  'use strict';
+  const G = window.G = window.G || {};
+  const DC = G.decor;
+  if (!DC) return;
+  const c = DC.M.c;
+  const BN = [c(0xeee6cf), c(0xd9cfb4), c(0xc4b99a)], OLD = [c(0xcfc3a3), c(0xb4a684), c(0x9a8c6c)], HOLE = c(0x2e2922);
+  const MOSS = c(0x7d9a4a), SAND = [c(0xe6d4a4), c(0xd2be8c), c(0xb3a070)];
+  const clamp = (v, a, b) => (v < a ? a : v > b ? b : v);
+  const smooth = (a, b, x) => { const t = clamp((x - a) / (b - a), 0, 1); return t * t * (3 - 2 * t); };
+  // spans along t (0 = snout tip .. 1 = tail tip)
+  const T_SKULL = 0.135, T_NECK = 0.29, T_HIP = 0.6;
+
+  // the spine in the model frame at t: [x, z, h] — z from +L/2 (snout) to -L/2, x the neck / tail sway, h the height of
+  // the vertebrae's centres over the ground (skull on the ground, the neck rising, the ribcage arching, the tail humps
+  // diving under the ground near its end)
+  DC.giantLine = function (L, bend, curl, t) {
+    const s = L / 56, z = L * (0.5 - t);
+    let x = 0;
+    if (t < T_NECK) x = bend * L * 0.1 * Math.pow((T_NECK - t) / T_NECK, 2);
+    else if (t > T_HIP) x = curl * L * 0.2 * Math.pow((t - T_HIP) / (1 - T_HIP), 2);
+    let h;
+    if (t < T_SKULL) h = 1.3;
+    else if (t < T_NECK) h = 1.3 + 5.3 * smooth(T_SKULL, T_NECK, t);
+    else if (t < T_HIP) h = 6.6 + 1.6 * Math.sin(Math.PI * (t - T_NECK) / (T_HIP - T_NECK));
+    else { const u = (t - T_HIP) / (1 - T_HIP); h = 6.6 * Math.pow(1 - u, 1.3) + 1.4 * u * Math.sin(u * Math.PI * 3) - 0.6 * u; }
+    return [x, z, h * s];
+  };
+
+  function arc(p0, p1, p2, p3, n) {                       // cubic bezier points
+    const out = [];
+    for (let i = 0; i <= n; i++) {
+      const t = i / n, u = 1 - t, a = u * u * u, b = 3 * u * u * t, cc = 3 * u * t * t, d = t * t * t;
+      out.push([a * p0[0] + b * p1[0] + cc * p2[0] + d * p3[0], a * p0[1] + b * p1[1] + cc * p2[1] + d * p3[1], a * p0[2] + b * p1[2] + cc * p2[2] + d * p3[2]]);
+    }
+    return out;
+  }
+  function bone(M, A, B, r, col) {
+    M.sgP(5, A, B, r, col || BN[0], r * 0.8);
+    M.ball(A[0], A[1], A[2], r * 1.45, r * 1.2, r * 1.45, col || BN[1], 'octa');
+    M.ball(B[0], B[1], B[2], r * 1.3, r * 1.1, r * 1.3, col || BN[1], 'octa');
+  }
+
+  DC.add('giant', {
+    name: 'Спящий исполин', solo: true, where: 'inland', face: 'rand', pad: false, tol: 3,
+    list: [{ r: 6, name: 'Спящий исполин' }],
+    build(D, v, M) {
+      const o = D.opt || {}, L = o.L || 56, s = L / 56, bend = o.bend || 0, curl = o.curl || 0;
+      const line = (t) => DC.giantLine(L, bend, curl, t);
+      // the ground under the spine, smoothed over 3 m either side (the vertebrae do not follow every bump)
+      const gS = (x, z) => (M.g(x, z) * 2 + M.g(x + 3, z) + M.g(x - 3, z) + M.g(x, z + 3) + M.g(x, z - 3)) / 6;
+      const yawAt = (t) => { const a = line(Math.max(0, t - 0.01)), b = line(Math.min(1, t + 0.01)); return Math.atan2(a[0] - b[0], a[1] - b[1]); };   // facing the snout
+
+      // ---- skull: cranium, boxy snout, swept horns, sockets, fangs; the lower jaw dropped open on the ground
+      {
+        const q0 = line(0.02), q1 = line(T_SKULL), yaw = Math.atan2(q0[0] - q1[0], q0[1] - q1[1]);
+        const bx = q1[0], bz = q1[1], F = M.frame(bx, gS(bx, bz), bz, yaw), P = (u, vv, w) => M.fp(F, u * s, vv * s, w * s);
+        const dy = M.rest(() => {
+          const cr = P(0, 2.3, 1.4);
+          M.ball(cr[0], cr[1], cr[2], 1.9 * s, 1.7 * s, 2.2 * s, BN[0], 'dode', yaw);
+          M.sgP(4, P(0, 2.35, 2.4), P(0, 1.55, 7.4), 1.35 * s, BN[1], 0.55 * s);
+          M.ball(...P(0, 1.45, 7.35), 0.62 * s, 0.5 * s, 0.5 * s, BN[1], 'octa', yaw);
+          for (const sd of [-1, 1]) {
+            M.tube(5, arc(P(sd * 1.0, 3.4, 1.9), P(sd * 1.9, 4.7, 0.6), P(sd * 2.25, 4.9, -1.0), P(sd * 1.8, 4.2, -2.2), 5), 0.42 * s, 0.05 * s, BN[2]);
+            M.tube(4, arc(P(sd * 0.7, 3.5, 2.6), P(sd * 1.0, 4.1, 2.0), P(sd * 1.1, 4.3, 1.3), P(sd * 1.0, 4.0, 0.9), 3), 0.22 * s, 0.04 * s, BN[2]);
+            let p = P(sd * 1.22, 2.7, 2.0); M.box(p[0], p[1], p[2], 0.42 * s, 0.7 * s, 0.9 * s, HOLE, yaw);          // eye socket
+            p = P(sd * 0.84, 1.95, 3.9); M.box(p[0], p[1], p[2], 0.26 * s, 0.5 * s, 1.2 * s, HOLE, yaw);           // cheek opening
+            p = P(sd * 0.42, 1.95, 6.95); M.box(p[0], p[1], p[2], 0.22 * s, 0.26 * s, 0.4 * s, HOLE, yaw);         // nostril
+            for (let k = 0; k < 7; k++) {                                                                      // upper fangs
+              const w = 3.0 + k * 0.62, r = 1.35 - 0.8 * (w - 2.4) / 5, ax = 2.35 - 0.8 * (w - 2.4) / 5;
+              const t = P(sd * 0.62 * r, ax - 0.7 * r + 0.05, w);
+              M.fr(3, t[0], t[1], t[2], (0.15 + (k === 1 ? 0.08 : 0)) * s, 0, (0.55 + (k === 1 ? 0.5 : 0.25 * Math.sin(k * 2.1))) * s, BN[0], yaw, Math.PI);
+            }
+            const hA = P(sd * 1.2, 1.0, 0.7), hB = P(sd * 0.42, 0.34, 6.9);
+            M.sgP(5, hA, hB, 0.44 * s, BN[1], 0.3 * s);                                                      // mandible
+            for (let k = 0; k < 7; k++) {                                                                      // lower fangs
+              const f = 0.3 + k * 0.095, t = [hA[0] + (hB[0] - hA[0]) * f, hA[1] + (hB[1] - hA[1]) * f + 0.2 * s, hA[2] + (hB[2] - hA[2]) * f];
+              M.fr(3, t[0], t[1], t[2], 0.14 * s, 0, (0.45 + 0.2 * Math.cos(k * 1.7)) * s, BN[0], yaw);
+            }
+          }
+          M.ball(...P(0, 0.34, 7.0), 0.5 * s, 0.35 * s, 0.45 * s, BN[1], 'octa', yaw);                       // chin
+          M.ball(...P(0, 1.3, -0.6), 0.9 * s, 0.9 * s, 0.7 * s, OLD[0], 'dode', yaw);                         // occipital knob
+        }, 0.1);
+        const cc = P(0, 0, 3.3);
+        D.solid(cc[0], cc[2], yaw, 2.0 * s, 4.1 * s, M.g(cc[0], cc[2]) - 1, M.g(cc[0], cc[2]) + dy + 3.6 * s);
+        D.keep(cc[0], cc[2], 5 * s);
+        for (let k = 0; k < 3; k++) {                                                                          // fallen fangs stuck in the ground
+          const a = yaw + (k - 1) * 0.9 + M.rnd(-0.3, 0.3), d = M.rnd(6.5, 9) * s, x = bx + Math.sin(a) * d, z = bz + Math.cos(a) * d;
+          M.fr(3, x, M.g(x, z) - 0.3 * s, z, 0.3 * s, 0, M.rnd(1.4, 2.1) * s, BN[k & 1], M.rnd(0, 6.3), M.rnd(-0.35, 0.35), M.rnd(-0.35, 0.35));
+          D.col(x, z, 0.35 * s, M.g(x, z) - 1, M.g(x, z) + 1.6 * s, true);
+        }
+      }
+
+      // ---- vertebrae from the neck to the tail tip: centrum + joint + a spine plate (a tall sail over the ribcage)
+      let prev = null, n = 0;
+      for (let t = T_SKULL + 0.012; t <= 0.995; t += 1.12 * s / L) {
+        const q = line(t), g = gS(q[0], q[1]), y = g + q[2];
+        const k = t < T_NECK ? 0.55 + 0.45 * (t - T_SKULL) / (T_NECK - T_SKULL) : t < T_HIP ? 1 : 1 - 0.68 * (t - T_HIP) / (1 - T_HIP);
+        if (q[2] < -0.1 * s) { prev = null; continue; }                                                       // (the tail dives under here)
+        const yaw = yawAt(t), gl = M.g(q[0], q[1]);
+        M.ball(q[0], y, q[1], 0.55 * k * s, 0.5 * k * s, 0.62 * k * s, BN[n & 1], 'octa', yaw);
+        if (prev) M.sgP(5, prev, [q[0], y, q[1]], 0.3 * k * s, BN[2], 0.3 * k * s);
+        const sail = t < T_NECK ? 0.45 + 0.4 * (t - T_SKULL) / (T_NECK - T_SKULL) : t < T_HIP ? 1.4 + 1.0 * Math.sin(Math.PI * (t - T_NECK) / (T_HIP - T_NECK)) : 0.9 * (1 - (t - T_HIP) / (1 - T_HIP)) + 0.15;
+        M.fr(4, q[0], y + 0.3 * k * s, q[1], 0.36 * k * s, 0.06 * s, sail * s, n % 5 === 2 ? OLD[1] : BN[0], yaw + Math.PI / 2, 0, -0.38, 0.32);
+        if (n % 3 === 1 && q[2] > 3 * s) M.ball(q[0], y + 0.45 * k * s, q[1], 0.32 * k * s, 0.16 * s, 0.4 * k * s, MOSS, 'octa', yaw);
+        if (t > T_HIP && (n & 1) && q[2] > 1.2 * s) {                                                       // chevrons under the tail
+          const cx = q[0], cz = q[1];
+          M.sg(4, cx, y - 0.25 * k * s, cz, cx, y - 1.0 * k * s, cz - 0.15 * s, 0.14 * k * s, BN[1], 0.06 * s);
+        }
+        if (y - gl < 2.4 && q[2] > -0.1) D.col(q[0], q[1], 0.62 * k * s + 0.1, gl - 1, y + 0.5 * k * s + sail * s * 0.5, true);
+        if (t > T_HIP || t < T_NECK) D.keep(q[0], q[1], 1.2 * s);
+        prev = [q[0], y, q[1]]; n++;
+      }
+
+      // ---- ribs: pairs arching from the spine down into the ground, the middle ones the widest; a few broken off
+      const tR0 = T_NECK + 0.025, tR1 = T_HIP - 0.02, nR = Math.max(6, Math.round((tR1 - tR0) * L / (1.6 * s)));
+      for (let i = 0; i < nR; i++) {
+        const t = tR0 + (tR1 - tR0) * i / (nR - 1), q = line(t), ys = gS(q[0], q[1]) + q[2], f = i / (nR - 1);
+        const w = s * (4.1 + 1.5 * Math.sin(Math.PI * f));
+        for (const sd of [-1, 1]) {
+          const fx = q[0] + sd * w, fz = q[1] - 0.9 * s, gF = M.g(fx, fz);
+          const pts = arc([q[0] + sd * 0.3 * s, ys - 0.15 * s, q[1]], [q[0] + sd * w * 0.85, ys + 0.9 * s, q[1] - 0.2 * s],
+            [q[0] + sd * w * 1.22, gF + (ys - gF) * 0.45, q[1] - 0.6 * s], [fx, gF - 0.35 * s, fz], 7);
+          const broken = i > 0 && i < nR - 1 && D.rng() < 0.14;
+          if (broken) {
+            const m = 3 + Math.floor(D.rng() * 2), tip = pts[m + 1];
+            M.tube(5, pts.slice(0, m + 1), 0.36 * s, 0.3 * s, BN[i & 1 ? 0 : 2]);
+            M.fr(3, pts[m][0], pts[m][1], pts[m][2], 0.28 * s, 0, 0.5 * s, BN[1], 0, Math.atan2(tip[2] - pts[m][2], tip[1] - pts[m][1]), -Math.atan2(tip[0] - pts[m][0], tip[1] - pts[m][1]));
+            const lx = fx + sd * M.rnd(0.5, 2) * s, lz = fz + M.rnd(-1.5, 1.5) * s, ex = lx - sd * M.rnd(1.5, 2.6) * s, ez = lz + M.rnd(-2, 2) * s;
+            const yy = M.lay(lx, lz, ex, ez, 6);
+            M.sg(5, lx, yy[0] + 0.24 * s, lz, ex, yy[1] + 0.2 * s, ez, 0.26 * s, BN[2], 0.18 * s);             // the fallen piece
+            continue;
+          }
+          M.tube(5, pts, 0.36 * s, 0.22 * s, BN[i & 1 ? 0 : 2]);
+          M.rock(fx, gF - 0.12 * s, fz, 0.75 * s, 0.32 * s, 0.75 * s, SAND, D.rng() * 6.3);                   // sand drifted round its foot
+          if (D.rng() < 0.3) { const p = pts[2]; M.ball(p[0], p[1] + 0.25 * s, p[2], 0.3 * s, 0.14 * s, 0.34 * s, MOSS, 'octa'); }
+          D.col(fx, fz, 0.32 * s + 0.08, gF - 1, gF + 2.4, true);
+        }
+      }
+      { const q = line((tR0 + tR1) / 2); D.keep(q[0], q[1], 6.2 * s); const q2 = line(tR0 + 0.03), q3 = line(tR1 - 0.03); D.keep(q2[0], q2[1], 5.5 * s); D.keep(q3[0], q3[1], 5.5 * s); }
+
+      // ---- forelimbs: shoulder blade, arm bones down to the ground, a hand of three great hooked claws
+      {
+        const t = T_NECK + 0.02, q = line(t), ys = gS(q[0], q[1]) + q[2], yaw = yawAt(t), cs = Math.cos(yaw), sn = Math.sin(yaw);
+        const at = (u, w) => [q[0] + u * cs + w * sn, q[1] - u * sn + w * cs];                            // u across (+X), w forward
+        for (const sd of [-1, 1]) {
+          const S = at(sd * 2.1 * s, 0), E = at(sd * 3.9 * s, 2.6 * s), Wr = at(sd * 3.4 * s, 4.7 * s);
+          const gE = M.g(E[0], E[1]), gW = M.g(Wr[0], Wr[1]);
+          M.ball(S[0], ys - 0.6 * s, S[1], 0.5 * s, 1.5 * s, 1.1 * s, OLD[1], 'dode', yaw, 0, sd * 0.4);
+          bone(M, [S[0], ys - 1.7 * s, S[1]], [E[0], gE + 1.1 * s, E[1]], 0.46 * s, BN[1]);
+          bone(M, [E[0], gE + 1.1 * s, E[1]], [Wr[0], gW + 0.4 * s, Wr[1]], 0.36 * s, BN[0]);
+          for (let k = -1; k <= 1; k++) {
+            const a = yaw + sd * 0.25 + k * 0.42, dx = Math.sin(a), dz = Math.cos(a), bx = Wr[0] + dx * 0.4 * s, bz = Wr[1] + dz * 0.4 * s;
+            const gc = M.g(bx + dx * 1.2 * s, bz + dz * 1.2 * s);
+            M.tube(4, arc([bx, gW + 0.35 * s, bz], [bx + dx * 1.0 * s, gW + 0.9 * s, bz + dz * 1.0 * s], [bx + dx * 1.9 * s, gc + 1.3 * s, bz + dz * 1.9 * s],
+              [bx + dx * 2.3 * s, gc + 0.5 * s, bz + dz * 2.3 * s], 4), 0.24 * s, 0.03 * s, k ? BN[1] : BN[0]);
+          }
+          D.col(E[0], E[1], 0.55 * s, gE - 1, gE + 1.7 * s, true);
+          D.col(Wr[0], Wr[1], 0.9 * s, gW - 1, gW + 1.0 * s, true);
+          D.keep(Wr[0], Wr[1], 2.6 * s);
+        }
+      }
+
+      // ---- hips: two great blades over the spine, the legs folded under, knees and toes out of the ground
+      {
+        const t = T_HIP, q = line(t), ys = gS(q[0], q[1]) + q[2], yaw = yawAt(t), cs = Math.cos(yaw), sn = Math.sin(yaw);
+        const at = (u, w) => [q[0] + u * cs + w * sn, q[1] - u * sn + w * cs];
+        for (const sd of [-1, 1]) {
+          const I = at(sd * 1.5 * s, 0), Hs = at(sd * 2.3 * s, 0.2 * s), K = at(sd * 4.3 * s, 3.3 * s), A = at(sd * 4.7 * s, -1.4 * s);
+          const gK = M.g(K[0], K[1]), gA = M.g(A[0], A[1]);
+          M.ball(I[0], ys - 0.2 * s, I[1], 1.9 * s, 1.3 * s, 2.6 * s, OLD[0], 'dode', yaw, 0, sd * 0.5);
+          M.sg(5, Hs[0], ys - 1.2 * s, Hs[1], I[0] + sd * 0.2 * s, ys - 2.9 * s, I[1] - 1.6 * s, 0.34 * s, OLD[1], 0.22 * s);   // ischium
+          bone(M, [Hs[0], ys - 1.4 * s, Hs[1]], [K[0], gK + 1.3 * s, K[1]], 0.58 * s, BN[0]);                  // femur
+          bone(M, [K[0], gK + 1.3 * s, K[1]], [A[0], gA + 0.35 * s, A[1]], 0.44 * s, BN[1]);                    // shin
+          for (let k = -1; k <= 1; k++) {                                                                       // toes
+            const a = yaw + Math.PI * 0.08 * sd + k * 0.4, dx = Math.sin(a), dz = Math.cos(a), ex = A[0] + dx * 2.2 * s, ez = A[1] + dz * 2.2 * s;
+            const ge = M.g(ex, ez);
+            M.tube(4, [[A[0], gA + 0.3 * s, A[1]], [A[0] + dx * 1.2 * s, (gA + ge) / 2 + 0.3 * s, A[1] + dz * 1.2 * s], [ex, ge + 0.12 * s, ez]], 0.26 * s, 0.12 * s, BN[1], true);
+            M.fr(3, ex, ge + 0.1 * s, ez, 0.2 * s, 0, 0.7 * s, BN[0], a, 1.25);
+          }
+          D.col(K[0], K[1], 0.7 * s, gK - 1, gK + 1.9 * s, true);
+          D.col(A[0], A[1], 0.9 * s, gA - 1, gA + 0.8 * s, true);
+          D.keep(K[0], K[1], 2.4 * s); D.keep(A[0], A[1], 2.8 * s);
+        }
+        D.keep(q[0], q[1], 4.2 * s);
+      }
+
+      // ---- loose bones scattered round it (and a few inside the ribcage)
+      for (let k = 0; k < 10; k++) {
+        const t = k < 3 ? M.rnd(T_NECK + 0.05, T_HIP - 0.05) : M.rnd(0.2, 0.9), q = line(t), a = M.rnd(0, 6.3), d = (k < 3 ? M.rnd(0.8, 2.6) : M.rnd(7, 12)) * s, x = q[0] + Math.cos(a) * d, z = q[1] + Math.sin(a) * d;
+        const a2 = M.rnd(0, 6.3), l = M.rnd(1.2, 2.6) * s, x2 = x + Math.cos(a2) * l, z2 = z + Math.sin(a2) * l, r = M.rnd(0.14, 0.26) * s;
+        const yy = M.lay(x, z, x2, z2, 6);
+        bone(M, [x, yy[0] + r, z], [x2, yy[1] + r * 0.9, z2], r, BN[k % 3]);
+      }
+    },
+  });
+})();
+
+</script>
 <script>/* src/weather.js */
 /* weather.js — G.weather: the weather of a round (sun, sky, fog + low haze, clouds, cloud shadows, sea, wind, rain,
    snow and snow cover, wetness, caustics, lightning, ambient sound, colour grade of the post pipeline). A round keeps
@@ -11256,7 +11920,8 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
 
   // sun: [colour, intensity, elevation°, azimuth°]   hemi: [sky, ground, intensity]   sky: [top, mid, horizon]
   // fog: [colour, near, far]   deck: extra cumulus overhead (0..30)   cloud: [colour, emissive] of all clouds
-  // shade: moving cloud shadows 0..1   sea: [colour multiplier, specular, wave k]   wind: sway k (palms, grass, rain)
+  // shade: moving cloud shadows 0..1   cov: [from, to] of the cloud shadow noise (lower: more ground in shadow)
+  // sea: [colour multiplier, specular, wave k]   wind: sway k (palms, grass, rain)
   // rain / snow: particle density   cover: snow on up-facing surfaces   lightK: fire + torches (> 1: lanterns lit)
   // lamps: the lanterns (ships' + the pirates' belt ones) lit at this strength without it being night (the storm)
   // belt: 0 = the pirates carry no lanterns (the evening dusk; blended: they light up as a dusk scenario gets dark)
@@ -11273,13 +11938,13 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
       haze: [0.0022, 14], glow: 0.35, caus: 1,
       post: { bloom: 0.45, thr: 0.9, rays: 0.55, sat: 1.06, con: 1.05, lift: [0, 0.004, 0.014], gain: [1.02, 1, 0.97], vig: 0.22 } },
     cloudy: { w: 1, name: 'Облачно', icon: '⛅', sun: [0xfff0dc, 2.8, 50, 40], hemi: [0xd6e2ee, 0x5d6b45, 0.95],
-      sky: [0x4d84bd, 0x9cc0dc, 0xcfdfe8], fog: [0xcfdfe8, 130, 500], deck: 16, cloud: [0xf6f8fa, 0x7d8894],
-      shade: 0.68, sea: [0xe2eaf0, 0x9cc8d8, 1.15], wind: 1.3, sat: 0.92, sound: [0, 0.14], disc: [0xfff6e8, 15, 0.22],
+      sky: [0x4d84bd, 0x9cc0dc, 0xcfdfe8], fog: [0xcfdfe8, 130, 500], deck: 46, cloud: [0xf6f8fa, 0x7d8894],
+      shade: 0.74, cov: [0.36, 0.5], sea: [0xe2eaf0, 0x9cc8d8, 1.15], wind: 1.3, sat: 0.92, sound: [0, 0.14], disc: [0xfff6e8, 15, 0.22],
       haze: [0.003, 14], glow: 0.25, caus: 0.6,
       post: { bloom: 0.4, thr: 0.9, rays: 0.75, sat: 1.0, con: 1.04, lift: [0, 0.005, 0.015], gain: [1, 1, 1], vig: 0.22 } },
     rain: { w: 1, name: 'Дождь', icon: '🌧️', sun: [0xd8e0ea, 1.0, 58, 40], hemi: [0xaab6c4, 0x3c4638, 0.92],
-      sky: [0x535f6b, 0x74808c, 0x8e99a3], fog: [0x8a96a0, 45, 290], deck: 26, cloud: [0x9aa3ad, 0x485059],
-      shade: 0.3, sea: [0x74848f, 0x8aa0b0, 1.9], wind: 2.1, rain: 1, sat: 0.68, sound: [0.65, 0.45], exp: 0.97,
+      sky: [0x535f6b, 0x74808c, 0x8e99a3], fog: [0x8a96a0, 45, 290], deck: 48, cloud: [0x9aa3ad, 0x485059],
+      shade: 0.3, cov: [0.32, 0.56], sea: [0x74848f, 0x8aa0b0, 1.9], wind: 2.1, rain: 1, sat: 0.68, sound: [0.65, 0.45], exp: 0.97,
       haze: [0.006, 18], glow: 0.08, caus: 0.12, wet: 1,
       post: { bloom: 0.35, thr: 0.92, rays: 0, sat: 0.96, con: 1.02, lift: [0, 0.01, 0.022], gain: [0.97, 0.99, 1.02], vig: 0.3 } },
     drizzle: { w: 1, name: 'Морось и туман', icon: '🌫️', sun: [0xe6eaee, 1.4, 50, 40], hemi: [0xc4ccd4, 0x4a5444, 1.05],
@@ -11293,13 +11958,13 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
       haze: [0.004, 10], glow: 0.7, caus: 0.45, belt: 0,
       post: { bloom: 0.75, thr: 0.86, rays: 1.0, sat: 1.08, con: 1.07, lift: [0.024, 0, 0.034], gain: [1.05, 0.99, 0.92], vig: 0.3 } },
     snow: { w: 1, name: 'Снегопад', icon: '❄️', sun: [0xf2f5ff, 1.7, 38, 40], hemi: [0xe4eaf4, 0x9aa4b0, 1.15],
-      sky: [0x8297ae, 0xb4c1cf, 0xd6dee7], fog: [0xd2dae3, 35, 280], deck: 20, cloud: [0xe8ecf0, 0x8a94a0],
+      sky: [0x8297ae, 0xb4c1cf, 0xd6dee7], fog: [0xd2dae3, 35, 280], deck: 36, cloud: [0xe8ecf0, 0x8a94a0],
       shade: 0.25, sea: [0x8a9aa8, 0xb8d0e0, 0.9], wind: 0.7, snow: 1, cover: 1, sat: 0.8, sound: [0, 0.22],
       haze: [0.004, 16], glow: 0.2, caus: 0.3,
       post: { bloom: 0.5, thr: 0.9, rays: 0.3, sat: 0.96, con: 1.02, lift: [0, 0.008, 0.02], gain: [0.98, 1, 1.03], vig: 0.22 } },
     storm: { w: 1, name: 'Гроза', icon: '⛈️', sun: [0xb8c6dc, 0.8, 60, 40], hemi: [0x808ca0, 0x2c3434, 1.05],
-      sky: [0x242b36, 0x3c4652, 0x55606b], fog: [0x4d5863, 30, 230], deck: 30, cloud: [0x5a626c, 0x232830],
-      shade: 0.2, sea: [0x50606b, 0x7890a0, 2.7], wind: 3, rain: 1.5, lightning: true, sat: 0.6, exp: 1.08, sound: [0.95, 0.8],
+      sky: [0x242b36, 0x3c4652, 0x55606b], fog: [0x4d5863, 30, 230], deck: 60, cloud: [0x5a626c, 0x232830],
+      shade: 0.2, cov: [0.3, 0.52], sea: [0x50606b, 0x7890a0, 2.7], wind: 3, rain: 1.5, lightning: true, sat: 0.6, exp: 1.08, sound: [0.95, 0.8],
       haze: [0.006, 20], glow: 0.05, caus: 0.05, wet: 1, lamps: 0.85,
       post: { bloom: 0.55, thr: 0.9, rays: 0, sat: 0.92, con: 1.1, lift: [0, 0.01, 0.02], gain: [0.97, 0.99, 1.03], vig: 0.36 } },
     dawn: { w: 1, name: 'Туманный рассвет', icon: '🌅', sun: [0xffc8a0, 2.4, 13, 55], hemi: [0xdde2f0, 0x6a6f55, 0.8],
@@ -11325,6 +11990,7 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
       post: { bloom: 0.8, thr: 0.86, rays: 0.5, sat: 1.0, con: 1.04, lift: [0.01, 0.01, 0.04], gain: [0.98, 0.98, 1.02], vig: 0.32 } },
   };
   const DEF_POST = { bloom: 0.45, thr: 0.9, rays: 0.3, sat: 1, con: 1, lift: [0, 0, 0], gain: [1, 1, 1], vig: 0.24 };
+  const DECK_N = 60;                                           // cumulus in the extra cloud deck (preset deck: how many show)
 
   // scenarios: from a preset, then [preset, start (match s), blend (s), announcement]; starts get ±15 s of jitter
   const SC = [
@@ -11342,11 +12008,13 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
 
   const WX = G.weather = { id: 'sunny', presets: P, scenarios: SC };
   const U = { noise: { value: null }, cloud: { value: null }, snow: { value: null }, roof: { value: null }, roofB: { value: null },
-    fog: { value: null }, sun: { value: null }, glowC: { value: null }, caus: { value: null }, env: { value: null }, post: { value: null } };
+    fog: { value: null }, sun: { value: null }, glowC: { value: null }, caus: { value: null }, env: { value: null }, post: { value: null },
+    cov: { value: null } };
   WX.uniforms = U;
   let roofFor = null;                                          // W.group the roof mask was sampled for
   let skyMat = null;                                           // sky dome material of the current world (flash)
   let installed = false, grp = null, deck = null, rain = null, snow = null, stars = null, disc = null, halo = null;
+  let bow = null, mist = null, veils = null, motes = null, bowK = 0;                   // rainbow, dawn mist, storm rain veils, sunlit motes
   let bolt = null, boltT = 0, nextStrike = 0, flashT = -1, thunderAt = -1, thunderFar = false, time = 0;
   let cur = null, scen = null, lastApply = -1, lastLightK = -1, lastLamps = -1, sndR = -1, sndW = -1, coverT = 0, wetT = 0, lightningOn = false;
   let domId = 'sunny', sunRef = null;
@@ -11365,7 +12033,7 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
   const VX = '\n  { vec4 wxP = vec4( transformed, 1.0 );\n#ifdef USE_INSTANCING\n  wxP = instanceMatrix * wxP;\n#endif\n' +
     '  vWxW = ( modelMatrix * wxP ).xyz; }\n';
   const CLOUD =
-    '  float wxCl = 1.0 - uWxC.w * smoothstep( 0.46, 0.7, texture2D( uWxN, vWxW.xz * uWxC.z + uWxC.xy ).r );\n' +
+    '  float wxCl = 1.0 - uWxC.w * smoothstep( uWxCv.x, uWxCv.y, texture2D( uWxN, vWxW.xz * uWxC.z + uWxC.xy ).r );\n' +
     '  reflectedLight.directDiffuse *= wxCl;\n  reflectedLight.directSpecular *= wxCl;\n';
   const CAUS_FN =                                              // tileable water caustic (4 warped sine iterations)
     'float wxCaus( vec2 q, float t ) {\n' +
@@ -11441,8 +12109,8 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
     sh.vertexShader = 'varying vec3 vWxW;\n' + vs.replace('#include <project_vertex>', '#include <project_vertex>' + VX);
     let head = 'uniform vec4 uWxF;\nuniform vec4 uWxSun;\nuniform vec3 uWxGC;\nuniform vec4 uWxE;\nuniform vec4 uWxP;\nvarying vec3 vWxW;\n';
     if (lit) {
-      sh.uniforms.uWxN = U.noise; sh.uniforms.uWxC = U.cloud; sh.uniforms.uWxS = U.snow; sh.uniforms.uWxK = U.caus;
-      head += 'uniform sampler2D uWxN;\nuniform vec4 uWxC;\nuniform vec4 uWxS;\nuniform vec3 uWxK;\n' + (ud.wxNoCaus ? '' : CAUS_FN);
+      sh.uniforms.uWxN = U.noise; sh.uniforms.uWxC = U.cloud; sh.uniforms.uWxS = U.snow; sh.uniforms.uWxK = U.caus; sh.uniforms.uWxCv = U.cov;
+      head += 'uniform sampler2D uWxN;\nuniform vec4 uWxC;\nuniform vec2 uWxCv;\nuniform vec4 uWxS;\nuniform vec3 uWxK;\n' + (ud.wxNoCaus ? '' : CAUS_FN);
       fs = fs.replace('#include <lights_fragment_end>', '#include <lights_fragment_end>\n' + CLOUD + (ud.wxNoCaus ? '' : CAUS))
         .replace('#include <color_fragment>', '#include <color_fragment>\n' + DESAT);
       const k = +ud.wxSnow || 0;
@@ -11468,6 +12136,7 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
     installed = true;
     U.noise.value = noiseTex();
     U.cloud.value = new THREE.Vector4(0, 0, 1 / 190, 0);
+    U.cov.value = new THREE.Vector2(0.46, 0.7);                // cloud shadow noise from .. to (see preset cov)
     U.snow.value = new THREE.Vector4(0, 0.12, 1, 0);           // snow cover, snow line, saturation, rain wetness
     U.roof.value = roofTex(new Uint8Array(1), 1);              // no roofs until a world is sampled (roofMask)
     U.roofB.value = new THREE.Vector4(0, 0, 1, 0);
@@ -11563,19 +12232,20 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
     const ico = new THREE.IcosahedronGeometry(1, 0);            // already non-indexed: flat facets
     const dm = new THREE.MeshLambertMaterial({ color: 0xffffff, emissive: 0x6f7f8c, flatShading: true, fog: false });
     dm.userData.wxOff = true;
-    deck = new THREE.InstancedMesh(ico, dm, 90);
+    deck = new THREE.InstancedMesh(ico, dm, DECK_N * 4);
     deck.frustumCulled = false; deck.count = 0; deck.name = 'cloudDeck';
     const m = new THREE.Matrix4(), q = new THREE.Quaternion(), e = new THREE.Euler(), s = new THREE.Vector3(), p = new THREE.Vector3();
     let sd = 4242; const rnd = () => (sd = (sd * 16807) % 2147483647) / 2147483647;
-    for (let c = 0; c < 30; c++) {                           // 30 cumulus of 3 puffs (like world.js buildClouds)
-      const a = rnd() * TAU, r = 40 + Math.sqrt(rnd()) * 380, y = 64 + rnd() * 40, sz = 8 + rnd() * 9;
+    for (let c = 0; c < DECK_N; c++) {                       // cumulus of 4 puffs (like world.js buildClouds); the first ones
+      // (the first 30: scattered to the horizon; the rest, for the grey days: bigger, crowding the sky over the island)
+      const a = rnd() * TAU, r = c < 30 ? 30 + Math.sqrt(rnd()) * 390 : 15 + Math.pow(rnd(), 0.8) * 250, y = 58 + rnd() * 50, sz = c < 30 ? 8 + rnd() * 9 : 12 + rnd() * 14;
       const cx = Math.cos(a) * r, cz = Math.sin(a) * r, ta = rnd() * TAU, tx = Math.cos(ta), tz = Math.sin(ta);
-      for (let k = 0; k < 3; k++) {
-        const u = k - 1, o = u * sz * 0.85 + (rnd() - 0.5) * 3, ps = sz * (1.05 - 0.4 * Math.abs(u)) * (0.85 + rnd() * 0.2);
-        p.set(cx + tx * o, y + ps * 0.3, cz + tz * o);
+      for (let k = 0; k < 4; k++) {
+        const u = (k - 1.5) / 1.5, o = u * sz * 0.9 + (rnd() - 0.5) * 3, ps = sz * (1.05 - 0.4 * Math.abs(u)) * (0.85 + rnd() * 0.2);
+        p.set(cx + tx * o + (rnd() - 0.5) * sz * 0.4, y + ps * 0.3, cz + tz * o + (rnd() - 0.5) * sz * 0.4);
         q.setFromEuler(e.set(rnd() * 0.4 - 0.2, rnd() * TAU, rnd() * 0.4 - 0.2));
         s.set(ps, ps * 0.62, ps * 0.85);
-        deck.setMatrixAt(c * 3 + k, m.compose(p, q, s));
+        deck.setMatrixAt(c * 4 + k, m.compose(p, q, s));
       }
     }
     grp.add(deck);
@@ -11662,8 +12332,222 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
     keepAlpha(stars.material, false); keepAlpha(halo.material, false); keepAlpha(rain.material, false);
     keepAlpha(snow.material, false); keepAlpha(bolt.material, false);
     grp.add(rain, snow, stars, disc, halo, bolt);
+    buildExtras(THREE);
     if (G.scene) G.scene.add(grp);
   }
+
+  // ---------------------------------------------------------------- sky + air extras
+  // rainbow: after rain, while the ground is still wet and the sun is out, a bow on the sky opposite the sun;
+  // mist: low drifting wisps over the ground and the water on a foggy morning (drizzle: a few);
+  // rain veils: grey curtains of rain sweeping over the island and the sea with the storm wind;
+  // motes: specks of pollen / dust glinting in the sun round the camera (sunny days, dawn, dusk)
+  const MIST_N = 56, VEIL_N = 6;
+  let mistL = null, veilL = null, WHITE = null;
+  // one strip per instance, placed in the shader (aC = centre + size): GN columns (position.z = the column's edge index),
+  // aG0 / aG1 = the ground height under its GN + 1 edges (so it fades out softly just above whatever ground it stands
+  // on, instead of being cut off by the terrain along a hard faceted line)
+  const GN = 7;
+  function billboards(THREE, n) {
+    const g = new THREE.InstancedBufferGeometry(), pos = [], idx = [];
+    for (let i = 0; i <= GN; i++) pos.push(-0.5 + i / GN, -0.5, i, -0.5 + i / GN, 0.5, i);
+    for (let i = 0; i < GN; i++) idx.push(i * 2, i * 2 + 2, i * 2 + 3, i * 2, i * 2 + 3, i * 2 + 1);
+    g.setAttribute('position', new THREE.BufferAttribute(new Float32Array(pos), 3));
+    g.setIndex(idx);
+    g.setAttribute('aC', new THREE.InstancedBufferAttribute(new Float32Array(n * 4), 4).setUsage(THREE.DynamicDrawUsage));
+    g.setAttribute('aD', new THREE.InstancedBufferAttribute(new Float32Array(n * 4), 4).setUsage(THREE.DynamicDrawUsage));
+    g.setAttribute('aG0', new THREE.InstancedBufferAttribute(new Float32Array(n * 4).fill(-99), 4).setUsage(THREE.DynamicDrawUsage));
+    g.setAttribute('aG1', new THREE.InstancedBufferAttribute(new Float32Array(n * 4).fill(-99), 4).setUsage(THREE.DynamicDrawUsage));
+    g.instanceCount = n;
+    return g;
+  }
+  // the ground under the edges of a strip at (x, z), w wide, facing the camera (right vector rx, rz) -> aG0 / aG1 of i
+  function groundUnder(A, i, x, z, w, rx, rz, H, wy) {
+    const a = A.aG0.array, b = A.aG1.array;
+    for (let k = 0; k <= GN; k++) {
+      const u = (-0.5 + k / GN) * w, g = Math.max(H(x + rx * u, z + rz * u), wy);
+      if (k < 4) a[i * 4 + k] = g; else b[i * 4 + k - 4] = g;
+    }
+  }
+  function buildExtras(THREE) {
+    WHITE = new THREE.Color(1, 1, 1);
+    // rainbow: two bands on the upper half of a disc — the bow (red outside, violet inside) and a faint second bow
+    // outside it with the colours the other way round; fading at their feet and under the horizon
+    {
+      const pos = [], ab = [], N = 64;
+      for (const [r0, r1, sec] of [[0.945, 1, 0], [1.15, 1.23, 1]]) {
+        for (let i = 0; i < N; i++) {
+          const a0 = i / N * Math.PI, a1 = (i + 1) / N * Math.PI;
+          const P = (a, r) => [Math.cos(a) * r, Math.sin(a) * r, 0];
+          const q = [P(a0, r0), P(a1, r0), P(a1, r1), P(a0, r1)], u0 = i / N, u1 = (i + 1) / N;
+          for (const [k, u, w] of [[0, u0, 0], [1, u1, 0], [2, u1, 1], [0, u0, 0], [2, u1, 1], [3, u0, 1]]) { pos.push(...q[k]); ab.push(u, w, sec); }
+        }
+      }
+      const g = new THREE.BufferGeometry();
+      g.setAttribute('position', new THREE.Float32BufferAttribute(pos, 3)); g.setAttribute('aB', new THREE.Float32BufferAttribute(ab, 3));
+      const m = new THREE.ShaderMaterial({
+        uniforms: { uOp: { value: 0 }, uCamY: { value: 0 } },
+        vertexShader: 'attribute vec3 aB;\nvarying vec3 vB;\nvarying float vY;\nvoid main() { vB = aB; vec4 w = modelMatrix * vec4( position, 1.0 ); vY = w.y;\n' +
+          '  gl_Position = projectionMatrix * viewMatrix * w; }',
+        fragmentShader: 'uniform float uOp, uCamY;\nvarying vec3 vB;\nvarying float vY;\n' +
+          'vec3 spec( float t ) { return clamp( vec3( abs( t * 6.0 - 3.0 ) - 1.0, 2.0 - abs( t * 6.0 - 2.0 ), 2.0 - abs( t * 6.0 - 4.0 ) ), 0.0, 1.0 ); }\n' +
+          'void main() { float t = vB.y, sec = step( 0.5, vB.z ); vec3 c = spec( 0.01 + 0.7 * mix( 1.0 - t, t, sec ) );\n' +
+          '  float a = uOp * mix( 1.0, 0.32, sec ) * pow( sin( 3.14159 * t ), 0.6 ) * smoothstep( 0.0, 0.16, vB.x ) * smoothstep( 1.0, 0.84, vB.x ) * smoothstep( uCamY - 5.0, uCamY + 40.0, vY );\n' +
+          '  gl_FragColor = vec4( c, a ); }',
+        transparent: true, depthWrite: false, fog: false, side: THREE.DoubleSide });
+      keepAlpha(m, false);
+      bow = new THREE.Mesh(g, m); bow.name = 'rainbow'; bow.frustumCulled = false; bow.renderOrder = -8; bow.visible = false;
+      grp.add(bow);
+    }
+    // mist wisps: soft noisy ellipses, turned to the camera round the vertical, faded near the lens and far away
+    const WISP = 'attribute vec4 aC;\nattribute vec4 aD;\nattribute vec4 aG0;\nattribute vec4 aG1;\nuniform float uOp, uT;\nvarying vec2 vUv, vN;\nvarying float vA, vH;\n' +
+      'void main() {\n  vec3 r = normalize( vec3( viewMatrix[0][0], 0.0, viewMatrix[2][0] ) );\n' +
+      '  vec3 p = aC.xyz + r * position.x * aC.w * aD.z + vec3( 0.0, 1.0, 0.0 ) * position.y * aC.w * aD.w;\n' +
+      '  vec4 k0 = 1.0 - step( vec4( 0.5 ), abs( vec4( position.z ) - vec4( 0.0, 1.0, 2.0, 3.0 ) ) );\n' +
+      '  vec4 k1 = 1.0 - step( vec4( 0.5 ), abs( vec4( position.z ) - vec4( 4.0, 5.0, 6.0, 7.0 ) ) );\n' +
+      '  vH = p.y - dot( aG0, k0 ) - dot( aG1, k1 );\n' +
+      '  vec4 mv = viewMatrix * vec4( p, 1.0 );\n  float d = -mv.z;\n' +
+      '  vA = aD.y * uOp * smoothstep( 2.0, 12.0, d ) * ( 1.0 - smoothstep( 70.0, 100.0, d ) );\n' +
+      '  vUv = position.xy + 0.5;\n  vN = vec2( aD.x * 7.0 + position.x * 0.9, aD.x * 3.0 + position.y * 0.5 );\n' +
+      '  gl_Position = projectionMatrix * mv;\n}';
+    const mm = new THREE.ShaderMaterial({
+      uniforms: { uOp: { value: 0 }, uT: { value: 0 }, uCol: { value: new THREE.Color() }, uN: U.noise },
+      vertexShader: WISP,
+      fragmentShader: 'uniform vec3 uCol;\nuniform float uT;\nuniform sampler2D uN;\nvarying vec2 vUv, vN;\nvarying float vA, vH;\n' +
+        'void main() { vec2 q = ( vUv - 0.5 ) * 2.0; float r = dot( q, q );\n' +
+        '  float n = texture2D( uN, vN + vec2( uT * 0.012, uT * 0.004 ) ).r;\n' +
+        '  float a = vA * ( 1.0 - smoothstep( 0.2, 1.0, r ) ) * smoothstep( 0.25, 0.75, n ) * smoothstep( 0.0, 1.6, vH );\n' +
+        '  if ( a < 0.003 ) discard;\n  gl_FragColor = vec4( uCol, a ); }',
+      transparent: true, depthWrite: false, fog: false });
+    keepAlpha(mm, false);
+    mist = new THREE.Mesh(billboards(THREE, MIST_N), mm); mist.name = 'mist'; mist.frustumCulled = false; mist.visible = false;
+    mistL = [];
+    for (let i = 0; i < MIST_N; i++) mistL.push({ x: 0, y: 0, z: 0, s: 1, life: 0, seed: Math.random() });
+    // rain veils: streaky grey curtains, standing on the sea level, turned to the camera round the vertical
+    const vm = new THREE.ShaderMaterial({
+      uniforms: { uOp: { value: 0 }, uT: { value: 0 }, uCol: { value: new THREE.Color() }, uN: U.noise },
+      vertexShader: WISP.replace('smoothstep( 2.0, 12.0, d ) * ( 1.0 - smoothstep( 70.0, 100.0, d ) )', 'smoothstep( 6.0, 24.0, d ) * ( 1.0 - smoothstep( 150.0, 210.0, d ) )'),
+      fragmentShader: 'uniform vec3 uCol;\nuniform float uT;\nuniform sampler2D uN;\nvarying vec2 vUv, vN;\nvarying float vA, vH;\n' +
+        'void main() {\n  float n = texture2D( uN, vec2( vUv.x * 2.2 + vN.x, vUv.y * 0.35 + uT * 0.45 + vN.y ) ).b;\n' +
+        '  float m = texture2D( uN, vec2( vUv.x * 0.6 + vN.x * 0.3, uT * 0.02 + vN.y ) ).r;\n' +
+        '  float a = vA * smoothstep( 0.0, 0.3, vUv.x ) * smoothstep( 1.0, 0.7, vUv.x ) * smoothstep( 1.0, 0.55, vUv.y ) * ( 0.35 + 0.9 * n ) * smoothstep( 0.3, 0.7, m ) * smoothstep( -0.5, 4.0, vH );\n' +
+        '  if ( a < 0.003 ) discard;\n  gl_FragColor = vec4( uCol, a ); }',
+      transparent: true, depthWrite: false, fog: false });
+    keepAlpha(vm, false);
+    veils = new THREE.Mesh(billboards(THREE, VEIL_N), vm); veils.name = 'rainVeils'; veils.frustumCulled = false; veils.visible = false;
+    veilL = [];
+    for (let i = 0; i < VEIL_N; i++) veilL.push({ x: 0, z: 0, s: 1, life: 0, seed: Math.random() });
+    // motes: tiny warm glints drifting round the camera (world-anchored box like the snow)
+    const n = 700, a = new Float32Array(n * 3);
+    for (let i = 0; i < n * 3; i++) a[i] = Math.random();
+    const gm = new THREE.BufferGeometry(); gm.setAttribute('position', new THREE.BufferAttribute(a, 3));
+    motes = new THREE.Points(gm, new THREE.ShaderMaterial({
+      uniforms: { uCam: { value: new THREE.Vector3() }, uT: { value: 0 }, uOp: { value: 0 }, uScale: { value: 500 }, uCol: { value: new THREE.Color(1, 0.93, 0.72) }, uSun: U.sun },
+      vertexShader: 'uniform vec3 uCam;\nuniform float uT, uScale;\nuniform vec4 uSun;\nvarying float vA;\nvoid main() {\n' +
+        '  vec3 p = position * vec3( 26.0, 9.0, 26.0 ) + vec3( sin( uT * 0.21 + position.y * 40.0 ), sin( uT * 0.33 + position.x * 30.0 ) * 0.4, cos( uT * 0.17 + position.z * 50.0 ) ) * 1.4;\n' +
+        '  p.xz = mod( p.xz - uCam.xz + 13.0, 26.0 ) - 13.0 + uCam.xz; p.y = uCam.y - 3.0 + mod( p.y - uCam.y + 3.0, 9.0 );\n' +
+        '  vec4 mv = viewMatrix * vec4( p, 1.0 );\n' +
+        '  float fw = max( dot( normalize( p - cameraPosition ), uSun.xyz ), 0.0 );\n' +      // glinting when seen against the sun
+        '  vA = ( 0.5 + 0.5 * sin( uT * ( 2.0 + position.x * 3.0 ) + position.z * 90.0 ) ) * smoothstep( 1.0, 3.0, -mv.z ) * ( 1.0 - smoothstep( 7.0, 12.0, -mv.z ) ) * ( 0.12 + 0.88 * pow( fw, 3.0 ) );\n' +
+        '  gl_PointSize = 0.03 * uScale / max( -mv.z, 0.1 );\n  gl_Position = projectionMatrix * mv;\n}',
+      fragmentShader: 'uniform float uOp;\nuniform vec3 uCol;\nvarying float vA;\nvoid main() { float d = length( gl_PointCoord - 0.5 ); if ( d > 0.5 ) discard;\n' +
+        '  float a = uOp * vA * smoothstep( 0.5, 0.0, d ); gl_FragColor = vec4( uCol, a ); }',
+      transparent: true, depthWrite: false, fog: false }));
+    keepAlpha(motes.material, true);
+    motes.name = 'motes'; motes.frustumCulled = false; motes.visible = false;
+    grp.add(mist, veils, motes);
+  }
+  // per frame: fade them in / out by the weather, move the wisps and the veils with the wind round the camera
+  function stepExtras(dt, t, cp, wv, S) {
+    const W = G.world, H = (x, z) => (W && W.heightAt ? W.heightAt(x, z) : 0), wy = (G.CFG && G.CFG.WATER_Y) || 0;
+    const M = WX.mood(), under = G.post && G.post.under > 0;
+    const ce = G.camera.matrixWorld.elements, rl = Math.hypot(ce[0], ce[2]) || 1, rx = ce[0] / rl, rz = ce[2] / rl;   // the camera's right
+    // rainbow
+    const bk = M.bow;
+    bowK += (bk - bowK) * Math.min(1, dt * 0.25);
+    bow.visible = bowK > 0.01 && !under;
+    if (bow.visible) {
+      const az = S.az * D2R, e = -Math.min(Math.max(S.el, 5), 18) * D2R, D = 620;       // (the bow kept on the sky whatever the sun's height)
+      _v.set(-Math.cos(e) * Math.cos(az), Math.sin(e), -Math.cos(e) * Math.sin(az));
+      bow.position.copy(cp).addScaledVector(_v, D); bow.scale.setScalar(D * Math.tan(42 * D2R));
+      bow.lookAt(cp);
+      bow.material.uniforms.uOp.value = bowK * 0.32; bow.material.uniforms.uCamY.value = cp.y;
+    }
+    // mist
+    const mk = M.mist;
+    mist.visible = mk > 0.02 && !under;
+    if (mist.visible) {
+      const A = mist.geometry.attributes, C = A.aC.array, Dd = A.aD.array, sp = 0.6 + 1.2 * (S.wind || 0.5);
+      for (let i = 0; i < MIST_N; i++) {
+        const w = mistL[i];
+        w.life -= dt;
+        w.x += wv.x * sp * dt; w.z += wv.z * sp * dt;
+        if (w.life <= 0 || Math.hypot(w.x - cp.x, w.z - cp.z) > 70) {
+          const a = Math.random() * TAU, r = 6 + Math.sqrt(Math.random()) * 52;
+          w.x = cp.x + Math.cos(a) * r; w.z = cp.z + Math.sin(a) * r;
+          const g = Math.max(H(w.x, w.z), wy);
+          w.y = g + 0.4 + Math.random() * 1.8; w.s = 8 + Math.random() * 12; w.life = 14 + Math.random() * 20; w.max = w.life; w.seed = Math.random();
+          if (!w.max0) { w.max0 = 1; w.life *= Math.random(); w.max = w.life + 4; }        // (the first ones: already there)
+        }
+        const f = Math.min(1, (w.max - w.life) / 4, w.life / 4);
+        C[i * 4] = w.x; C[i * 4 + 1] = w.y; C[i * 4 + 2] = w.z; C[i * 4 + 3] = w.s;
+        Dd[i * 4] = w.seed; Dd[i * 4 + 1] = 0.6 * f; Dd[i * 4 + 2] = 1.6; Dd[i * 4 + 3] = 0.3;
+        groundUnder(A, i, w.x, w.z, w.s * 1.6, rx, rz, H, wy);
+      }
+      A.aC.needsUpdate = true; A.aD.needsUpdate = true; A.aG0.needsUpdate = true; A.aG1.needsUpdate = true;
+      const u = mist.material.uniforms;
+      u.uOp.value = mk; u.uT.value = t; u.uCol.value.copy(G.scene.fog ? G.scene.fog.color : _fog).lerp(WHITE, 0.5);
+    }
+    // rain veils
+    const vk = M.veil;
+    veils.visible = vk > 0.02 && !under;
+    if (veils.visible) {
+      const A = veils.geometry.attributes, C = A.aC.array, Dd = A.aD.array, sp = 3 + 3 * (S.wind || 1);
+      for (let i = 0; i < VEIL_N; i++) {
+        const v = veilL[i];
+        v.life -= dt;
+        v.x += wv.x * sp * dt; v.z += wv.z * sp * dt;
+        const ahead = (v.x - cp.x) * wv.x + (v.z - cp.z) * wv.z;
+        if (v.life <= 0 || ahead > 160 || Math.hypot(v.x - cp.x, v.z - cp.z) > 200) {
+          const lat = (Math.random() - 0.5) * 240, back = 60 + Math.random() * 110;
+          v.x = cp.x - wv.x * back - wv.z * lat; v.z = cp.z - wv.z * back + wv.x * lat;
+          v.s = 36 + Math.random() * 30; v.life = 40 + Math.random() * 30; v.max = v.life; v.seed = Math.random();
+        }
+        const f = Math.min(1, (v.max - v.life) / 5, v.life / 5);
+        C[i * 4] = v.x; C[i * 4 + 1] = wy - 2 + v.s * 0.5; C[i * 4 + 2] = v.z; C[i * 4 + 3] = v.s;
+        Dd[i * 4] = v.seed; Dd[i * 4 + 1] = 0.42 * f; Dd[i * 4 + 2] = 1.1; Dd[i * 4 + 3] = 1;
+        groundUnder(A, i, v.x, v.z, v.s * 1.1, rx, rz, H, wy - 3);
+      }
+      A.aC.needsUpdate = true; A.aD.needsUpdate = true; A.aG0.needsUpdate = true; A.aG1.needsUpdate = true;
+      const u = veils.material.uniforms;
+      u.uOp.value = vk; u.uT.value = t; u.uCol.value.copy(G.scene.fog ? G.scene.fog.color : _fog).lerp(WHITE, 0.28);   // (lighter than the dark air behind)
+    }
+    // motes
+    const ok = M.motes;
+    motes.visible = ok > 0.02 && !under && !(W && W.underRoof && W.underRoof(cp.x, cp.y, cp.z));
+    if (motes.visible) {
+      const u = motes.material.uniforms;
+      u.uOp.value = ok * 0.55; u.uT.value = t; u.uCam.value.copy(cp);
+      u.uScale.value = G.renderer.domElement.height / (2 * Math.tan(G.camera.fov * D2R / 2));
+      u.uCol.value.setRGB(S.sunC[0], S.sunC[1], S.sunC[2]).lerp(WHITE, 0.4);
+    }
+  }
+  // what the air is like now (0..1 each, from the blended weather): sun (bright direct sun, not raining, day),
+  // fair (sun + few clouds: birds, butterflies), storm, rain, wind (sway k), night, wet (the ground), mist (a foggy
+  // morning), veil (storm rain curtains), motes (sunlit specks), bow (a rainbow)
+  WX.mood = function () {
+    const S = cur;
+    if (!S) return { sun: 0, fair: 0, storm: 0, rain: 0, wind: 1, night: 0, wet: 0, mist: 0, veil: 0, motes: 0, bow: 0 };
+    const rain = clamp(S.rain, 0, 1.5), night = WX.night(), sunL = clamp(S.sunI * sunFade(S.el) / 2.4, 0, 1) * (1 - clamp(rain * 2, 0, 1)) * (1 - night);
+    const fair = sunL * (1 - clamp(S.deck / 60, 0, 1) * 0.6) * clamp((S.fogF - 120) / 200, 0, 1);
+    const wet = U.snow.value ? U.snow.value.w : 0;
+    return {
+      sun: sunL, fair, storm: clamp(S.lightning, 0, 1), rain, wind: S.wind, night, wet,
+      mist: clamp((S.hazeD - 0.0075) / 0.0075, 0, 1) * (1 - clamp(rain * 1.5, 0, 1) * 0.5) * (1 - night * 0.5),
+      veil: clamp((rain - 0.8) / 0.7, 0, 1),
+      motes: fair * (1 - clamp((S.wind - 1.2) / 1.2, 0, 1)) * (S.snow > 0.05 ? 0 : 1),
+      bow: smooth(0.12, 0.35, wet) * (1 - smooth(0.04, 0.2, rain)) * clamp((S.sunI * sunFade(S.el) - 1.2) / 1.2, 0, 1) * (1 - night) * (1 - clamp(S.deck / 60, 0, 1) * 0.5),
+    };
+  };
 
   function strike() {
     const THREE = G.THREE, cam = G.camera;
@@ -11703,7 +12587,7 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
       sky0: hx(p.sky[0]), sky1: hx(p.sky[1]), sky2: hx(p.sky[2]),
       fogC: hx(p.fog[0]), fogN: p.fog[1], fogF: p.fog[2],
       deck: p.deck || 0, cloudC: hx(p.cloud[0]), cloudE: hx(p.cloud[1]), cloudV: p.noClouds ? 0 : 1,
-      shade: p.shade || 0, seaC: hx(p.sea[0]), seaS: hx(p.sea[1]), wave: p.sea[2], wind: p.wind,
+      shade: p.shade || 0, covL: p.cov ? p.cov[0] : 0.46, covH: p.cov ? p.cov[1] : 0.7, seaC: hx(p.sea[0]), seaS: hx(p.sea[1]), wave: p.sea[2], wind: p.wind,
       rain: p.rain || 0, snow: p.snow || 0, cover: p.cover || 0, wet: p.wet || 0,
       lightK: p.lightK || 1, lamps: p.lamps || 0, belt: p.belt == null ? 1 : p.belt, lightning: p.lightning ? 1 : 0, stars: p.stars ? 1 : 0,
       discC: hx(p.disc ? p.disc[0] : 0xffffff), discS: p.disc ? p.disc[1] : 20, discO: p.disc ? p.disc[2] : 0,
@@ -11764,7 +12648,8 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
       o.clouds.visible = cv > 0.03;
       o.clouds.traverse((m) => { if (m.isMesh) { m.material.color.setRGB(cc[0], cc[1], cc[2], SR); m.material.emissive.setRGB(ce[0], ce[1], ce[2], SR); } });
     }
-    deck.count = 3 * Math.min(30, Math.round(S.deck)); deck.visible = deck.count > 0;
+    deck.count = 4 * Math.min(DECK_N, Math.round(S.deck)); deck.visible = deck.count > 0;
+    U.cov.value.set(S.covL, S.covH);
     deck.material.color.setRGB(cc[0], cc[1], cc[2], SR); deck.material.emissive.setRGB(ce[0], ce[1], ce[2], SR);
     // sea, wind, lamps
     if (o.water) { o.water.material.color.setRGB(S.seaC[0], S.seaC[1], S.seaC[2], SR); o.water.material.specular.setRGB(S.seaS[0], S.seaS[1], S.seaS[2], SR); }
@@ -12008,6 +12893,7 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
       disc.position.copy(cp).addScaledVector(_v, 760); halo.position.copy(cp).addScaledVector(_v, 770);
       disc.lookAt(cp); halo.lookAt(cp);
     }
+    stepExtras(dt, t, cp, wv, p);
     // lightning: bolt + double flash of sky / ambient, thunder after the light
     if (lightningOn) {
       if (time >= nextStrike) { strike(); nextStrike = time + 4 + Math.random() * 9; }
@@ -12236,6 +13122,7 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
       let q = null;
       try { q = new URLSearchParams(location.search).get('q'); } catch (e) { /* ignore */ }
       if (!LEVELS[q]) { try { q = localStorage.getItem(KEY); } catch (e) { q = null; } }
+      if (!LEVELS[q] && LEVELS[G.defaultQuality]) q = G.defaultQuality;          // (the playable on a phone: low)
       if (LEVELS[q]) P.quality = q;
       ready = true;
       return true;
@@ -12461,7 +13348,10 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
 /* fauna.js — G.fauna: the island's animals and the wind-blown bits.
    Gulls circle over the shore and sit on masts / sea stacks, parrots sit in palm crowns, bats come out at night,
    crabs scuttle on the beaches, fish schools and rays swim in the shallows, dolphins leap far out, fireflies glow at
-   night, leaves blow downwind. Animals take fright at gunshots, falling palms, breaking crates and passers-by; a flock
+   night, leaves blow downwind. Fair weather (G.weather.mood().fair) brings more birds — a third gull flock,
+   frigatebirds soaring high over the island, swifts darting low over the meadows — and butterflies round the flowers;
+   dragonflies hover at the reeds; a strong wind tears leaves, palm fronds and twigs off and flings them past.
+   The fair-weather extras never flush a flock that gives anyone away ('fauna:alarm') and never cry. Animals take fright at gunshots, falling palms, breaking crates and passers-by; a flock
    taking off from a shot emits 'fauna:alarm' {x, y, z, team} (ai.js: enemies nearby go and look). Visual only.
    Built lazily for every world (all meshes live in W.group). ?fauna=0 turns it off. Classic script; THREE only after boot. */
 (function () {
@@ -12481,6 +13371,7 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
   let T = null, W = null, builtFor = null, time = 0;
   const U = { t: { value: 0 }, night: { value: 0 } };
   let birds = [], crabs = [], schools = [], rays = [], dolphins = null, leaves = null, flies = null;
+  let bugs = [], debris = null, fairK = 0, bugK = 0, dragK = 0;
   let meshes = {}, perches = [], palmTops = [], alarmT = new Map(), cryT = 0;
   let _m = null, _q = null, _e = null, _s = null, _v = null, _p = null;
 
@@ -12746,6 +13637,10 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
     buildFlies();
     // wind-blown leaves near the camera
     buildLeaves();
+    // fair weather: more birds; butterflies + dragonflies; storm debris
+    buildFairBirds(centres);
+    buildBugs();
+    buildDebris();
     meshes.gulls = gm; meshes.bats = bm; meshes.crabs = cm; meshes.rays = rm; meshes.dolphins = dm;
     U.night.value = G.weather && G.weather.night ? G.weather.night() : 0;   // (eased from here on)
   }
@@ -12786,7 +13681,7 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
     flies = pts;
   }
   function buildLeaves() {
-    const n = 70, g = Geo();
+    const n = 180, g = Geo();
     g.tri([0, 0, 0.1], [0.05, 0.01, -0.02], [0, 0, -0.08], 0xffffff, 0); g.tri([0, 0, 0.1], [0, 0, -0.08], [-0.05, 0.01, -0.02], 0xffffff, 0);
     const geo = g.build('wing');
     const m = new T.MeshLambertMaterial({ side: T.DoubleSide, flatShading: true });
@@ -12796,9 +13691,178 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
     for (let i = 0; i < n; i++) { mesh.setColorAt(i, new T.Color(cols[i % cols.length])); _m.makeScale(0, 0, 0); mesh.setMatrixAt(i, _m); }
     W.group.add(mesh);
     leaves = { mesh, L: [] };
-    for (let i = 0; i < n; i++) leaves.L.push({ i, life: 0, p: new T.Vector3(), v: new T.Vector3(), r: new T.Vector3(), w: new T.Vector3(), s: rnd(0.8, 1.6) });
+    for (let i = 0; i < n; i++) leaves.L.push({ i, life: 0, p: new T.Vector3(), v: new T.Vector3(), r: new T.Vector3(), w: new T.Vector3(), s: i < 70 ? rnd(0.8, 1.6) : rnd(1.2, 2.2) });
+  }
+  // ---- fair-weather birds (b.extra; b.fairT: shown while the weather is fairer than that)
+  function buildFairBirds(centres) {
+    const nG = 9, gm = instanced('gulls2', birdGeo({ len: 0.46, span: 1.15, body: 0.07, cBody: 0xf4f4f0, cBelly: 0xe6e8ea, cBeak: 0xf2b632,
+      cTail: 0xe9ebec, cWing: 0xaab4bc, cTip: 0x2e3238, cUnder: 0xf2f3f2, cUnderTip: 0x5a6068, tail: 0.1 }), mat(FLAP, 'wing'), nG);
+    const b0 = beachSpot(40), c3 = b0 ? { x: b0.x, z: b0.z } : { x: -centres[0].x, z: -centres[0].z };
+    for (let i = 0; i < nG; i++) {
+      const a = Math.random() * TAU;
+      birds.push({ kind: 'gull', extra: true, fairT: rnd(0.25, 0.7), mesh: gm, i, st: 'away', c: c3, r: rnd(16, 34), h: rnd(12, 26), th: a,
+        om: rnd(0.2, 0.32) * (Math.random() < 0.5 ? -1 : 1), p: new T.Vector3(c3.x, 20, c3.z), v: new T.Vector3(), yaw: 0, bank: 0, t: rnd(5, 25), perch: null, flapT: 0, s: rnd(0.9, 1.1) });
+    }
+    const nF = 5, fm = instanced('frigates', birdGeo({ len: 0.95, span: 2.3, body: 0.09, cBody: 0x202026, cBelly: 0x2c2c32, cBeak: 0x8a8a90,
+      cTail: 0x1a1a20, cWing: 0x26262c, cTip: 0x141418, cUnder: 0x34343a, tail: 0.5 }), mat(FLAP, 'wing'), nF);
+    const cc = W.camp && W.camp.center ? W.camp.center : { x: 0, z: 0 };
+    for (let i = 0; i < nF; i++) {
+      const a = Math.random() * TAU, c = { x: cc.x * 0.4 + rnd(-20, 20), z: cc.z * 0.4 + rnd(-20, 20) };
+      birds.push({ kind: 'frigate', extra: true, fairT: rnd(0.45, 0.8), mesh: fm, i, st: 'away', c, r: rnd(35, 75), h: rnd(36, 58), th: a,
+        om: rnd(0.07, 0.12) * (Math.random() < 0.5 ? -1 : 1), p: new T.Vector3(c.x, 50, c.z), v: new T.Vector3(), yaw: 0, bank: 0, flapT: rnd(4, 12), s: rnd(0.9, 1.15) });
+    }
+    const nS = 14, sm = instanced('swifts', birdGeo({ len: 0.17, span: 0.44, body: 0.03, cBody: 0x3a3430, cBelly: 0x5a524a, cBeak: 0x2a2622,
+      cTail: 0x3a3430, cWing: 0x2e2a26, cTip: 0x1e1c1a, cUnder: 0x4a443e, tail: 0.3 }), mat(FLAP, 'wing'), nS);
+    const pl = (W.plants || []).filter((q) => q.y > 1.5);
+    for (let f = 0; f < 2; f++) {
+      const q = pl.length ? pl[Math.floor(Math.random() * pl.length)] : { x: rnd(-30, 30), z: rnd(-30, 30) }, fl = { x: q.x, z: q.z, tx: q.x, tz: q.z, t: 0 };
+      for (let k = 0; k < nS / 2; k++) {
+        birds.push({ kind: 'swift', extra: true, fairT: rnd(0.3, 0.75), mesh: sm, i: f * (nS / 2) + k, st: 'away', flock: fl, p: new T.Vector3(q.x, 8, q.z), v: new T.Vector3(),
+          tgt: new T.Vector3(q.x, 6, q.z), yaw: 0, bank: 0, t: 0, s: 1 });
+      }
+    }
+    meshes.gulls2 = gm; meshes.frigates = fm; meshes.swifts = sm;
+  }
+  // ---- butterflies round the flowers (fair days) + dragonflies at the reeds and the water (calm days)
+  function butterflyGeo() {
+    const g = Geo(), cb = 0x2a2420, cw = 0xffffff;
+    g.tri([0, 0.012, 0.05], [0.008, 0, -0.05], [-0.008, 0, -0.05], cb, 0); g.tri([0, 0.012, 0.05], [-0.008, 0, -0.05], [0.008, 0, -0.05], cb, 0);
+    for (const sd of [-1, 1]) {
+      const X = (v) => [sd * v[0], v[1], v[2]];
+      g.quad(X([0.006, 0.005, 0.035]), X([0.1, 0.01, 0.075]), X([0.13, 0.01, 0.005]), X([0.01, 0.005, -0.005]), cw, sd * 0.15, sd, sd, sd * 0.15);    // forewing
+      g.quad(X([0.008, 0.005, -0.005]), X([0.09, 0.008, -0.01]), X([0.07, 0.006, -0.07]), X([0.006, 0.004, -0.035]), cw, sd * 0.15, sd, sd, sd * 0.15);   // hindwing
+    }
+    return g.build('wing');
+  }
+  function dragonflyGeo() {
+    const g = Geo(), cb = 0x2f7a8a, ct = 0x1f5a66, cw = 0xd8e6ee;
+    g.tri([0, 0.012, 0.03], [0.01, 0, -0.1], [-0.01, 0, -0.1], cb, 0); g.tri([0, 0.012, 0.03], [-0.01, 0, -0.1], [0.01, 0, -0.1], ct, 0);
+    g.tri([0, 0.008, -0.1], [0.004, 0, -0.2], [-0.004, 0, -0.2], ct, 0);
+    for (const sd of [-1, 1]) for (const z0 of [0.018, -0.012]) {
+      const X = (v) => [sd * v[0], v[1], v[2] + z0];
+      g.quad(X([0.006, 0.01, 0.008]), X([0.13, 0.012, 0.012]), X([0.13, 0.012, -0.006]), X([0.006, 0.01, -0.008]), cw, sd * 0.1, sd, sd, sd * 0.1);
+    }
+    return g.build('wing');
+  }
+  function buildBugs() {
+    bugs = [];
+    const pl = W.plants || [], flowers = pl.filter((q) => q.kind === 1 || q.kind === 9 || q.kind === 8), anyP = pl.filter((q) => q.y > 0.6 && q.kind !== 7);
+    const homes = flowers.length ? flowers : anyP;
+    const nB = homes.length ? 34 : 0;
+    if (nB) {
+      const bm = instanced('butterflies', butterflyGeo(), mat(FLAP, 'wing', T.DoubleSide), nB), cols = [0xf2d23a, 0xf08a2a, 0xf6f4ec, 0x3a8ce0, 0xd84a3a, 0xf2c8e0];
+      for (let i = 0; i < nB; i++) {
+        const h = homes[Math.floor(Math.random() * homes.length)], c = new T.Color(cols[i % cols.length]);
+        bm.setColorAt(i, c);
+        bugs.push({ kind: 'fly', mesh: bm, i, home: { x: h.x, z: h.z }, p: new T.Vector3(h.x, h.y + 1, h.z), v: new T.Vector3(), tgt: new T.Vector3(h.x, h.y + 1, h.z), t: 0, yaw: 0, fT: rnd(0.1, 0.6), shown: true, s: rnd(1.6, 2.3) });
+      }
+      if (bm.instanceColor) bm.instanceColor.needsUpdate = true;
+      meshes.butterflies = bm;
+    }
+    const reeds = pl.filter((q) => q.kind === 7), nD = reeds.length ? Math.min(10, 3 + Math.floor(reeds.length / 8)) : 0;
+    if (nD) {
+      const dm = instanced('dragonflies', dragonflyGeo(), mat(FLAP, 'wing', T.DoubleSide), nD);
+      for (let i = 0; i < nD; i++) {
+        const h = reeds[Math.floor(Math.random() * reeds.length)];
+        bugs.push({ kind: 'drag', mesh: dm, i, home: { x: h.x, z: h.z }, p: new T.Vector3(h.x, Math.max(h.y, 0) + 1, h.z), v: new T.Vector3(), tgt: new T.Vector3(h.x, h.y + 1, h.z), t: 0, yaw: 0, fT: rnd(0.1, 0.5), shown: true, s: 1.5 });
+        setFl(dm, i, 0.35, 48, Math.random() * TAU, 0.05);
+      }
+      meshes.dragonflies = dm;
+    }
+  }
+  function stepBug(q, dt, show, actors) {
+    if (!show) { if (q.shown) { q.shown = false; hide(q.mesh, q.i); } return; }
+    if (!q.shown) { q.shown = true; }
+    const P = q.p, drag = q.kind === 'drag';
+    q.t -= dt;
+    for (let i = 0; i < actors.length; i++) {                     // someone walking up: off it goes
+      const a = actors[i];
+      if (!a.alive || !a.pos) continue;
+      if (Math.abs(a.pos.x - P.x) < 1.8 && Math.abs(a.pos.z - P.z) < 1.8 && Math.abs(a.pos.y + 1 - P.y) < 1.6) { q.t = 0; q.fleeT = 1.2; break; }
+    }
+    if (q.t <= 0) {
+      const g0 = Math.max(W.heightAt(q.home.x, q.home.z), WY());
+      if (drag) {                                                   // dart to the next hover point, then hover
+        const a = Math.random() * TAU, r = rnd(0.5, 4);
+        q.tgt.set(q.home.x + Math.cos(a) * r, 0, q.home.z + Math.sin(a) * r);
+        q.tgt.y = Math.max(W.heightAt(q.tgt.x, q.tgt.z), WY()) + rnd(0.5, 1.6);
+        q.t = rnd(0.6, 2.2);
+      } else {
+        const a = Math.random() * TAU, r = rnd(0.3, 3), up = q.fleeT > 0 ? rnd(2, 4) : rnd(0.3, 1.5);
+        q.tgt.set(q.home.x + Math.cos(a) * r, g0 + up, q.home.z + Math.sin(a) * r);
+        q.t = rnd(0.8, 2.4);
+      }
+    }
+    if (q.fleeT > 0) q.fleeT -= dt;
+    const dx = q.tgt.x - P.x, dy = q.tgt.y - P.y, dz = q.tgt.z - P.z, d = Math.hypot(dx, dy, dz) || 1;
+    const spd = drag ? (d > 0.3 ? 5 : 0.3) : (q.fleeT > 0 ? 3 : 1.2), k = Math.min(1, (drag ? 6 : 2.2) * dt);
+    q.v.x += (dx / d * spd - q.v.x) * k; q.v.y += (dy / d * spd - q.v.y) * k; q.v.z += (dz / d * spd - q.v.z) * k;
+    if (!drag) { q.v.y += Math.sin(time * 9 + q.i * 3) * 1.2 * dt * 6; q.v.x += Math.cos(time * 5 + q.i) * 0.8 * dt * 4; }   // the fluttering stagger
+    P.addScaledVector(q.v, dt);
+    const g = Math.max(W.heightAt(P.x, P.z), WY());
+    if (P.y < g + 0.15) P.y = g + 0.15;
+    const hs = Math.hypot(q.v.x, q.v.z);
+    if (hs > 0.15) q.yaw += angDiff(q.yaw, Math.atan2(q.v.x, q.v.z)) * Math.min(1, 8 * dt);
+    if (!drag) setFl(q.mesh, q.i, 1.15, 15 + (q.i % 5), q.i * 1.3, 0.35);
+    place(q.mesh, q.i, P, q.yaw, drag ? 0 : -0.25, 0, q.s);
+  }
+  // ---- storm debris: torn palm fronds and twigs flung past on a strong wind (the leaves: stepLeaves)
+  function frondGeo() {
+    const g = Geo(), c = 0xffffff;
+    const at = (t, w) => [w, 0.02 * Math.sin(t * 3), 0.3 - t * 0.6];
+    for (let i = 0; i < 4; i++) {
+      const t = 0.1 + i * 0.22;
+      for (const sd of [-1, 1]) g.tri(at(t, 0), at(t + 0.1, 0), at(t + 0.2, sd * 0.13 * (1 - t * 0.5)), c, 0);
+    }
+    g.tri(at(0, 0.008), at(1, 0.004), at(1, -0.004), c, 0);
+    return g.build('wing');
+  }
+  function twigGeo() {
+    const g = Geo(), c = 0xffffff, P = (x, y, z) => [x, y, z];
+    g.tri(P(0, 0.012, 0.22), P(0.012, -0.008, -0.22), P(-0.012, -0.008, -0.22), c, 0);
+    g.tri(P(0, 0.012, 0.22), P(-0.012, -0.008, -0.22), P(0.012, -0.008, -0.22), c, 0);
+    g.tri(P(0, 0.008, 0.02), P(0.12, 0.004, 0.14), P(0.006, -0.006, 0.0), c, 0);
+    return g.build('wing');
+  }
+  function buildDebris() {
+    const mk = (name, geo, n, cols) => {
+      const m = new T.InstancedMesh(geo, new T.MeshLambertMaterial({ side: T.DoubleSide, flatShading: true }), n);
+      m.name = name; m.frustumCulled = false; m.instanceMatrix.setUsage(T.DynamicDrawUsage);
+      for (let i = 0; i < n; i++) { m.setColorAt(i, new T.Color(cols[i % cols.length])); _m.makeScale(0, 0, 0); m.setMatrixAt(i, _m); }
+      W.group.add(m);
+      const L = [];
+      for (let i = 0; i < n; i++) L.push({ i, life: 0, p: new T.Vector3(), v: new T.Vector3(), r: new T.Vector3(), w: new T.Vector3(), s: rnd(1.1, 2.0), shown: false });
+      return { mesh: m, L };
+    };
+    debris = [mk('fronds', frondGeo(), 50, [0x5fa343, 0x7fb24a, 0xa8a04a, 0x8a7a3a]), mk('twigs', twigGeo(), 40, [0x6f5a40, 0x8a7458, 0x5a4834])];
+  }
+  // one flying piece (a leaf, a frond, a twig): spawned upwind of the camera (some right on its line of sight, so they
+  // fly past the lens), carried by the gusts, tumbling, settling on the ground; heavy = falls faster
+  function flyPiece(l, Lv, dt, want, spd, wind, cam, heavy) {
+    if (l.life <= 0) {
+      if (Math.random() > want * dt * 3) { if (l.shown) { l.shown = false; hide(Lv.mesh, l.i); } return; }
+      const past = Math.random() < 0.35, side = past ? rnd(-3, 3) : rnd(-24, 24), back = past ? rnd(8, 16) : rnd(4, 30);
+      const x = cam.position.x - wind.x * back - wind.z * side, z = cam.position.z - wind.z * back + wind.x * side;
+      const g = W.heightAt(x, z);
+      if (!(g > 0.3) && !past) return;
+      l.p.set(x, past ? cam.position.y + rnd(-1.2, 1.2) : Math.max(g, WY()) + rnd(1, 7), z); l.life = rnd(3, 6); l.shown = true;
+      l.v.set(wind.x * spd, rnd(-0.3, 0.8), wind.z * spd); l.r.set(Math.random() * TAU, Math.random() * TAU, Math.random() * TAU);
+      l.w.set(rnd(-7, 7), rnd(-7, 7), rnd(-7, 7));
+    }
+    l.life -= dt;
+    const gust = 0.7 + 0.5 * Math.sin(time * 1.3 + l.i) + (spd > 5 ? 0.35 * Math.sin(time * 3.1 + l.i * 0.7) : 0);
+    l.v.y += (-0.5 * (heavy || 1) + Math.sin(time * 3 + l.i) * 0.8) * dt;
+    l.v.x += (wind.x * spd * gust - l.v.x) * dt * (heavy ? 0.7 : 1);
+    l.v.z += (wind.z * spd * (0.7 + 0.5 * Math.cos(time * 1.1 + l.i)) - l.v.z) * dt * (heavy ? 0.7 : 1);
+    l.p.addScaledVector(l.v, dt);
+    const g = Math.max(W.heightAt(l.p.x, l.p.z), WY() - 0.02);
+    if (l.p.y < g + 0.03) { l.p.y = g + 0.03; l.v.set(0, 0, 0); l.w.multiplyScalar(0.9); }
+    l.r.addScaledVector(l.w, dt);
+    _e.set(l.r.x, l.r.y, l.r.z); _q.setFromEuler(_e); const sc = l.s * Math.min(1, l.life * 2); _s.set(sc, sc, sc);
+    _m.compose(l.p, _q, _s); Lv.mesh.setMatrixAt(l.i, _m);
   }
   function clear() {
+    bugs = []; debris = null;
     birds = []; crabs = []; schools = []; rays = []; dolphins = null; leaves = null; flies = null; meshes = {}; perches = []; palmTops = [];
     builtFor = null;
   }
@@ -12813,6 +13877,7 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
       const d = Math.hypot(b.p.x - x, b.p.z - z, (b.p.y - y) * 0.5);
       const rr = r * (b.kind === 'bat' ? 0.6 : 1);
       if (d > rr) continue;
+      if (b.extra) { if (b.kind === 'gull' && b.st === 'circle' && loud) { b.st = 'flee'; b.t = 3; fleeFrom(b, x, z); } continue; }
       if (b.kind === 'gull' && (b.st === 'perch' || b.st === 'toPerch')) { takeOff(b, x, z); flew++; }
       else if (b.kind === 'gull' && b.st === 'circle' && loud) { b.st = 'flee'; b.t = 3; fleeFrom(b, x, z); flew++; }
       else if (b.kind === 'parrot' && b.st === 'perch') { parrotFly(b, x, z, 30, 70); flew++; }
@@ -12897,7 +13962,7 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
         b.t -= dt;
         if (b.t <= 0) {                                          // settle on a free perch now and then
           const pf = perches.filter((q) => !q.taken && !(q.ship && q.ship.sail) && Math.hypot(q.x - P.x, q.z - P.z) < 70);
-          if (pf.length && Math.random() < 0.6) { const q = pf[Math.floor(Math.random() * pf.length)]; q.taken = b; b.perch = q; b.st = 'toPerch'; }
+          if (!b.extra && pf.length && Math.random() < 0.6) { const q = pf[Math.floor(Math.random() * pf.length)]; q.taken = b; b.perch = q; b.st = 'toPerch'; }
           b.t = rnd(15, 35);
         }
         b.flapT -= dt;                                           // glide, a few flaps now and then
@@ -12916,6 +13981,28 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
         b.t -= dt;
         if (b.t <= 0) { b.st = 'circle'; b.t = rnd(12, 30); }
       }
+    } else if (b.kind === 'frigate') {                           // soaring high in slow wide circles, hardly a wingbeat
+      b.th += b.om * dt;
+      tx = b.c.x + Math.cos(b.th) * b.r; tz = b.c.z + Math.sin(b.th) * b.r; ty = b.h + 4 * Math.sin(b.th * 0.7);
+      b.flapT -= dt;
+      if (b.flapT < -1.5) b.flapT = rnd(6, 14);
+      spd = 8; flapA = b.flapT < 0 ? 0.45 : 0.03; flapF = 5; turn = 0.9; rest = 0.08;
+    } else if (b.kind === 'swift') {                              // darting low over the meadows in a loose flock
+      const fl = b.flock;
+      fl.t -= dt / 14;                                            // (each of the flock's birds ticks it: ~1 / s per flock)
+      if (fl.t <= 0) {
+        fl.t = rnd(8, 16);
+        const pl = W.plants || [], q = pl.length ? pl[Math.floor(Math.random() * pl.length)] : null;
+        if (q && q.y > 1) { fl.tx = q.x; fl.tz = q.z; }
+      }
+      fl.x += (fl.tx - fl.x) * Math.min(1, dt * 0.05); fl.z += (fl.tz - fl.z) * Math.min(1, dt * 0.05);
+      b.t -= dt;
+      if (b.t <= 0) {
+        b.t = rnd(0.5, 1.3);
+        const a = Math.random() * TAU, r = rnd(4, 24), x = fl.x + Math.cos(a) * r, z = fl.z + Math.sin(a) * r;
+        b.tgt.set(x, Math.max(W.heightAt(x, z), WY()) + rnd(2.5, 10), z);
+      }
+      tx = b.tgt.x; ty = b.tgt.y; tz = b.tgt.z; spd = 12; turn = 4.5; flapA = Math.sin(time * 2 + b.i) > 0.2 ? 0.9 : 0.1; flapF = 20;
     } else if (b.kind === 'parrot') {
       if (b.st === 'perch') {
         V.set(0, 0, 0);
@@ -12969,6 +14056,19 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
     setFl(b.mesh, b.i, flapA, flapF, b.i * 1.7, rest);
     place(b.mesh, b.i, P, b.yaw, -Math.atan2(V.y, Math.max(hs, 0.1)) * 0.7, b.bank, b.s);
   }
+  // fair-weather extras: gone (hidden) while the weather is worse than their threshold; back in from high up
+  function fairGate(b) {
+    if (fairK < b.fairT) {
+      if (b.st !== 'away') { if (b.perch) { b.perch.taken = null; b.perch = null; } b.st = 'away'; hide(b.mesh, b.i); }
+      return true;
+    }
+    if (b.st === 'away') {
+      const a = Math.random() * TAU, c = b.c || b.flock;
+      b.p.set(c.x + Math.cos(a) * 90, b.kind === 'swift' ? 25 : 45, c.z + Math.sin(a) * 90); b.v.set(0, 0, 0);
+      b.st = b.kind === 'gull' ? 'circle' : 'fly'; b.t = rnd(15, 30);
+    }
+    return false;
+  }
   function stepCrab(c, dt, actors) {
     // someone walking up: run sideways, then dig in
     if (c.st === 'idle' || c.st === 'walk') {
@@ -12976,7 +14076,7 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
         const a = actors[i];
         if (!a.alive || !a.pos) continue;
         const d = Math.hypot(a.pos.x - c.x, a.pos.z - c.z);
-        if (d < 3.2 && Math.abs(a.pos.y - c.y) < 2) { crabFlee(c, a.pos.x, a.pos.z); if (G.sfx && Math.random() < 0.3) G.sfx.play('rustle', { x: c.x, y: c.y, z: c.z }); break; }
+        if (d < 3.2 && Math.abs(a.pos.y - c.y) < 2) { crabFlee(c, a.pos.x, a.pos.z); if (G.sfx && Math.random() < 0.3) G.sfx.play('rustle', { x: c.x, y: c.y, z: c.z }, { k: 0.6 }); break; }
       }
     }
     c.t -= dt;
@@ -13062,30 +14162,18 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
   }
   function stepLeaves(dt) {
     const Lv = leaves, cam = G.camera, env = W.env || {}, wk = env.windK || 1, wind = W.wind || { x: 1, z: 0 };
-    const want = wk < 0.9 ? 0 : clamp((wk - 0.9) * 0.6, 0, 1);   // calm air: none; storms: plenty
-    const spd = 1.2 + 2.2 * wk;
-    for (const l of Lv.L) {
-      if (l.life <= 0) {
-        if (Math.random() > want * dt * 3) { if (l.shown) { l.shown = false; hide(Lv.mesh, l.i); } continue; }
-        const a = Math.random() * TAU, r = rnd(4, 26), x = cam.position.x + Math.cos(a) * r - wind.x * 8, z = cam.position.z + Math.sin(a) * r - wind.z * 8;
-        const g = W.heightAt(x, z);
-        if (!(g > 0.3)) continue;
-        l.p.set(x, g + rnd(1.5, 6), z); l.life = rnd(3, 6); l.shown = true;
-        l.v.set(wind.x * spd, rnd(-0.3, 0.6), wind.z * spd); l.r.set(Math.random() * TAU, Math.random() * TAU, Math.random() * TAU);
-        l.w.set(rnd(-6, 6), rnd(-6, 6), rnd(-6, 6));
-      }
-      l.life -= dt;
-      l.v.y += (-0.5 + Math.sin(time * 3 + l.i) * 0.8) * dt;
-      l.v.x += (wind.x * spd * (0.7 + 0.5 * Math.sin(time * 1.3 + l.i)) - l.v.x) * dt;
-      l.v.z += (wind.z * spd * (0.7 + 0.5 * Math.cos(time * 1.1 + l.i)) - l.v.z) * dt;
-      l.p.addScaledVector(l.v, dt);
-      const g = W.heightAt(l.p.x, l.p.z);
-      if (l.p.y < g + 0.03) { l.p.y = g + 0.03; l.v.set(0, 0, 0); l.w.multiplyScalar(0.9); }
-      l.r.addScaledVector(l.w, dt);
-      _e.set(l.r.x, l.r.y, l.r.z); _q.setFromEuler(_e); const sc = l.s * Math.min(1, l.life * 2); _s.set(sc, sc, sc);
-      _m.compose(l.p, _q, _s); Lv.mesh.setMatrixAt(l.i, _m);
-    }
+    // calm air: none; a breeze: a few (the first 70); storms: all of them, and the fronds / twigs too
+    const want = wk < 0.9 ? 0 : clamp((wk - 0.9) * 0.6, 0, 1), spd = 1.2 + 2.2 * wk, nOn = wk < 1.8 ? 70 : Lv.L.length;
+    for (const l of Lv.L) flyPiece(l, Lv, dt, l.i < nOn ? want : 0, spd, wind, cam, 0);
     Lv.mesh.instanceMatrix.needsUpdate = true;
+    if (debris) {
+      const wd = clamp((wk - 1.8) / 1.1, 0, 1);
+      for (let k = 0; k < debris.length; k++) {
+        const D = debris[k];
+        for (const l of D.L) flyPiece(l, D, dt, wd, spd * (k ? 0.85 : 0.75), wind, cam, k ? 2.2 : 1.6);
+        D.mesh.instanceMatrix.needsUpdate = true;
+      }
+    }
   }
 
   F.update = function (dt) {
@@ -13118,7 +14206,12 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
         if (Math.hypot(a.pos.x - b.p.x, a.pos.z - b.p.z) < (b.kind === 'parrot' ? 5 : 7) && dy < 6 && dy > -2) { F.scare(b.p.x, b.p.y, b.p.z, 6, a.team, false); break; }
       }
     }
-    for (const b of birds) stepBird(b, dt, U.night.value);
+    const md = G.weather && G.weather.mood ? G.weather.mood() : null;
+    fairK += ((md ? md.fair : 0.5) - fairK) * Math.min(1, dt * 0.3);
+    bugK += ((md ? md.fair * (1 - clamp((md.wind - 1.6) / 0.8, 0, 1)) : 0.5) - bugK) * Math.min(1, dt * 0.5);
+    dragK += ((md ? md.sun * (1 - clamp((md.wind - 1.8) / 0.8, 0, 1)) * (1 - md.rain) : 0.5) - dragK) * Math.min(1, dt * 0.5);
+    for (const b of birds) { if (b.fairT != null && fairGate(b)) continue; stepBird(b, dt, U.night.value); }
+    for (const q of bugs) stepBug(q, dt, (q.kind === 'drag' ? dragK : bugK) > q.fT, actors);
     for (const c of crabs) stepCrab(c, dt, actors);
     for (const s of schools) stepSchool(s, dt, actors);
     for (const r of rays) stepRay(r, dt);
@@ -13136,7 +14229,7 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
       cryT = rnd(4, 10);
       const cp = G.camera.position;
       let best = null, bd = 45;
-      for (const b of birds) { if (b.kind !== 'gull') continue; const d = b.p.distanceTo(cp); if (d < bd) { bd = d; best = b; } }
+      for (const b of birds) { if (b.kind !== 'gull' || b.extra) continue; const d = b.p.distanceTo(cp); if (d < bd) { bd = d; best = b; } }
       if (best && night < 0.5) G.sfx.play('gull', best.p);
     }
   };
@@ -13145,7 +14238,9 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
     const n = {};
     for (const b of birds) { const k = b.kind + ':' + b.st; n[k] = (n[k] || 0) + 1; }
     return { on: F.on, birds: n, perches: perches.length, crabs: crabs.map((c) => c.st).join(','), schools: schools.length, rays: rays.length,
-      dolphins: !!dolphins, fireflies: !!flies, night: +U.night.value.toFixed(2) };
+      dolphins: !!dolphins, fireflies: !!flies, night: +U.night.value.toFixed(2), fair: +fairK.toFixed(2),
+      bugs: bugs.filter((q) => q.shown).length + '/' + bugs.length, debris: debris ? debris.map((D) => D.L.filter((l) => l.life > 0).length).join('+') : 0,
+      leaves: leaves ? leaves.L.filter((l) => l.life > 0).length : 0 };
   };
   F.list = function () { return { birds, crabs, schools, rays, dolphins, perches }; };
 })();
@@ -13283,12 +14378,24 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
         fpM = new THREE.Matrix4(); fpQ = new THREE.Vector3(); fpS = new THREE.Vector3(); fpN = new THREE.Vector3(); fpX = new THREE.Vector3(); fpZ = new THREE.Vector3();
         group.add(fpMesh);
       }
-      // camp-fire smoke: grey puffs rising and drifting downwind, growing and thinning out
-      const smg = new THREE.IcosahedronGeometry(1, 0);
+      // camp-fire smoke: soft grey billows rising and drifting downwind, growing and thinning out (camera-facing
+      // cards with a cloudy texture, lit as if from above: big see-through faceted blobs looked angular)
+      const smg = new THREE.PlaneGeometry(2, 2), nr = smg.attributes.normal;
+      for (let i = 0; i < nr.count; i++) nr.setXYZ(i, 0, 1, 0);
+      const smt = (() => {
+        const c = document.createElement('canvas'); c.width = c.height = 64;
+        const x = c.getContext('2d');
+        for (const [cx, cy, r, a] of [[32, 34, 24, 0.55], [22, 30, 15, 0.45], [42, 28, 14, 0.45], [30, 22, 13, 0.4], [38, 40, 13, 0.35], [24, 40, 12, 0.35]]) {
+          const g = x.createRadialGradient(cx, cy, 0, cx, cy, r);
+          g.addColorStop(0, 'rgba(255,255,255,' + a + ')'); g.addColorStop(1, 'rgba(255,255,255,0)');
+          x.fillStyle = g; x.fillRect(0, 0, 64, 64);
+        }
+        return new THREE.CanvasTexture(c);
+      })();
       for (let i = 0; i < N_SMOKE; i++) {
-        const m = new THREE.Mesh(smg, new THREE.MeshLambertMaterial({ color: 0x9a948c, transparent: true, opacity: 0, depthWrite: false, flatShading: true }));
+        const m = new THREE.Mesh(smg, new THREE.MeshLambertMaterial({ color: 0x9a948c, map: smt, transparent: true, opacity: 0, depthWrite: false }));
         m.visible = false; group.add(m);
-        smokes.push({ mesh: m, t: 0, max: 1, vx: 0, vy: 0, vz: 0 });
+        smokes.push({ mesh: m, t: 0, max: 1, vx: 0, vy: 0, vz: 0, roll: 0 });
       }
       G.scene.add(group);
       ready = true;
@@ -13339,11 +14446,12 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
     p.mesh.visible = true;
   }
 
-  function ring(pos, r0, r1, life, op) {
+  function ring(pos, r0, r1, life, op, hex) {
     const r = rings[rI]; rI = (rI + 1) % N_RING;
     r.mesh.position.set(pos.x, pos.y, pos.z);
     r.r0 = r0; r.r1 = r1; r.t = r.max = life; r.op = op;
     r.mesh.scale.setScalar(r0);
+    r.mesh.material.color.setHex(hex != null ? hex : 0xffffff);
     r.mesh.material.opacity = op;
     r.mesh.visible = true;
   }
@@ -13443,6 +14551,22 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
       }
     },
 
+    // a shock wave over the ground (a falling crown landing): two dust rings racing out to r, dust thrown up round them
+    shock(pos, r, kind) {
+      if (!pos || !fin(pos.x) || !fin(pos.y) || !fin(pos.z) || !init()) return;
+      const col = kind === 'sand' ? 0xeadcb2 : 0xb8a88e, cols = COLORS[kind] || COLORS.dirt;
+      tv2.set(pos.x, pos.y + 0.12, pos.z);
+      ring(tv2, 0.4, r * 1.15, 0.5, 0.75, col);
+      ring(tv2, 0.25, r * 0.7, 0.4, 0.6, col);
+      puff(tv2, col, 0.3, r * 0.55, 0.6, 0.45);
+      const floor = floorFor(tv2);
+      for (let i = 0; i < 14; i++) {
+        const a = i / 14 * TAU + Math.random() * 0.3, h = 2.2 + Math.random() * 2;
+        spawnP(tv2, Math.sin(a) * h, 0.9 + Math.random() * 1.6, Math.cos(a) * h, 0.04 + Math.random() * 0.04, 0.5 + Math.random() * 0.3,
+          cols[i % cols.length], 14, floor, 1);
+      }
+    },
+
     splash(pos) {
       if (!pos || !fin(pos.x) || !fin(pos.z) || !init()) return;
       const WY = waterY();
@@ -13488,7 +14612,7 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
       if (!fin(x) || !fin(y) || !fin(z) || !init()) return;
       const p = smokes[smI]; smI = (smI + 1) % N_SMOKE;
       p.mesh.position.set(x + (Math.random() - 0.5) * 0.3, y, z + (Math.random() - 0.5) * 0.3);
-      p.mesh.rotation.set(Math.random() * TAU, Math.random() * TAU, 0);
+      p.roll = Math.random() * TAU;
       p.t = p.max = 3.5 + Math.random() * 1.5;
       p.vx = (fin(wx) ? wx : 0) + (Math.random() - 0.5) * 0.2; p.vz = (fin(wz) ? wz : 0) + (Math.random() - 0.5) * 0.2; p.vy = 0.8 + Math.random() * 0.4;
       p.mesh.visible = true; p.mesh.scale.setScalar(0.2);
@@ -13597,9 +14721,10 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
         if (p.t <= 0) { p.mesh.visible = false; continue; }
         const u = 1 - p.t / p.max;
         p.mesh.position.x += p.vx * dt * (0.4 + u); p.mesh.position.z += p.vz * dt * (0.4 + u); p.mesh.position.y += p.vy * dt * (1 - 0.4 * u);
-        p.mesh.scale.setScalar(0.25 + 1.4 * Math.sqrt(u));
-        p.mesh.rotation.y += dt * 0.3;
-        p.mesh.material.opacity = 0.3 * Math.min(1, u * 6) * (1 - u);
+        p.mesh.scale.setScalar(0.35 + 1.9 * Math.sqrt(u));
+        p.roll += dt * 0.25;
+        if (G.camera) { p.mesh.quaternion.copy(G.camera.quaternion); p.mesh.rotateZ(p.roll); }
+        p.mesh.material.opacity = 0.55 * Math.min(1, u * 6) * (1 - u);
       }
       // rings
       for (let i = 0; i < N_RING; i++) {
@@ -13921,10 +15046,15 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
       tone(out, t + 0.45, 'sawtooth', f * 1.3, f * 1.05, 0.35, 0.06, 0.08, 500);
       noise(out, t, 0.6, 'bandpass', 420, 360, 7, 0.05, 0.15);
     },
-    rustle(out, t) {
-      const P = [];
-      for (let i = 0; i < 3; i++) P.push([t + i * 0.06 + Math.random() * 0.03, 0.08 + Math.random() * 0.07, 3200 - i * 500, 1800, 0.16]);
-      pops(out, P, 'bandpass', 1.1);
+    // leaves brushing past (o.k = loudness: the walker's speed): soft overlapping swishes (slow 25 ms attack, a wide
+    // band 1.1-2.6 kHz) + a dull body; each its own voice (not a pop train: nothing is cut off mid-swish)
+    rustle(out, t, o) {
+      const k = V(o, 'k');
+      for (let i = 0; i < 4; i++) {
+        const t0 = t + i * 0.07 + Math.random() * 0.04, f0 = 2600 - Math.random() * 600;
+        noise(out, t0, 0.14 + Math.random() * 0.1, 'bandpass', f0, f0 * 0.5, 0.6, 0.0325 * k, 0.025 + Math.random() * 0.015);
+      }
+      noise(out, t, 0.26, 'lowpass', 950, 480, 0.7, 0.0225 * k, 0.04);
     },
     smash(out, t) {
       noise(out, t, 0.28, 'highpass', 2600, 1400, 0.8, 0.5, 0.002);
@@ -14050,7 +15180,7 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
     whistle: { ui: 1 }, gull: { range: 90 }, flap: { range: 60 },
     anchor: { range: 140 }, plank: { range: 120 },
     rocket: { range: 400, occ: false }, burst: { range: 500, occ: false, delay: 1 },
-    creak: { range: 45 }, rustle: { range: 30 }, bone: { range: 60 },
+    creak: { range: 45 }, rustle: { range: 30, dup: 0.1 }, bone: { range: 60 },
   };
   // footsteps: min = no voice below this chain gain (a step past ~25 m is lost under everything else; the most played sound)
   for (const k in SYNTH) if (k.slice(0, 5) === 'step_') META[k] = { range: 32, dup: 0, min: 0.05 };
@@ -16458,7 +17588,7 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
   let nextId = 1;
 
   const EMPTY_INPUT = { mx: 0, mz: 0, sprint: false, jump: false, fire: false, reload: false, melee: false,
-                        interact: false, aiming: false, aimYaw: NaN, aim: null };
+                        interact: false, aiming: false, crouch: false, aimYaw: NaN, aim: null };
 
   // shared temporaries (created lazily, THREE is not available at load time)
   let T = null;
@@ -16986,7 +18116,7 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
   // animation state (see the animation section)
   function initAnim(R) {
     R.cyc = Math.random(); R.legYaw = 0; R.back = 0; R.accX = 0; R.accZ = 0; R.pvx = null; R.pvz = 0; R.pyaw = 0;
-    R.slope = 0; R.gx = 0; R.gz = 0; R.airT = 0; R.jumped = false; R.lead = 1; R.landT = 1; R.landS = 0;
+    R.slope = 0; R.gx = 0; R.gz = 0; R.airT = 0; R.flyT = 0; R.jumped = false; R.lead = 1; R.landT = 1; R.landS = 0;
     R.flX = 0; R.flZ = 0; R.flVX = 0; R.flVZ = 0; R.flH = 0.8; R.rec = 0; R.recV = 0; R.swim = 0; R.step2 = -1;
     R.death = null;
   }
@@ -17210,15 +18340,17 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
     }
     const d = a.cur && G.weapons.DEFS[a.cur], L = 0.57 + ((d && d.tip) || 0.33);
     const p = pitchOf(a), cp = Math.cos(p);
-    return out.set(a.pos.x - fz * 0.3 + fx * cp * L, a.pos.y + 1.44 + Math.sin(p) * L, a.pos.z + fx * 0.3 + fz * cp * L);
+    return out.set(a.pos.x - fz * 0.3 + fx * cp * L, a.pos.y + 1.44 - crDrop(a) + Math.sin(p) * L, a.pos.z + fx * 0.3 + fz * cp * L);
   }
   A.muzzle = function (a) { return muzzlePoint(a, tmp().mz); };
-  A.eye = function (a) { return tmp().eye.set(a.pos.x, a.pos.y + (a.alive ? 1.68 : 0.3), a.pos.z); };
+  // how much lower a crouching pirate's eyes, gun and body top are (a.crouchK: 0 standing .. 1 down)
+  function crDrop(a) { return a.crouchK > 0 ? a.crouchK * ((G.CFG.CROUCH && G.CFG.CROUCH.drop) || 0.45) : 0; }
+  A.eye = function (a) { return tmp().eye.set(a.pos.x, a.pos.y + (a.alive ? 1.68 - crDrop(a) : 0.3), a.pos.z); };
   A.center = function (a) {
     if (a.alive && a.swimming) {        // the shoulders of the forward-leaning swimmer just above the water (head: 0.71 / 1.56)
       return tmp().cen.set(a.pos.x + Math.sin(a.yaw) * 0.45, a.pos.y + 1.35, a.pos.z + Math.cos(a.yaw) * 0.45);
     }
-    return tmp().cen.set(a.pos.x, a.pos.y + (!a.alive ? 0.3 : 1.2), a.pos.z);
+    return tmp().cen.set(a.pos.x, a.pos.y + (!a.alive ? 0.3 : 1.2 - 0.7 * crDrop(a)), a.pos.z);
   };
 
   // ------------------------------------------------------------------ belt lanterns (dark rounds)
@@ -17392,12 +18524,22 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
     const pos = M.geometry.attributes.position.array, col = M.geometry.attributes.color.array, per = POOL_G * POOL_G;
     const k0 = POOL_K * Math.min(1, nk), P = PV.list || (PV.list = []);
     P.length = 0;
+    // a ship sailing in (the intro: show.js) is drawn off its anchorage (sp.sail) while the crew's physics stays on the
+    // anchored deck: their pools go along with the drawn ship
+    const sailOf = (a) => { if (!W.ships) return null; for (const sp of W.ships) if (sp.sail && sp.isOnDeck(a.pos)) return sp; return null; };
+    const toSail = (sp, x, z, o) => {
+      if (!sp) { o.x = x; o.z = z; return o; }
+      const sl = sp.sail, c = Math.cos(sl.yaw), s = Math.sin(sl.yaw), dx = x - sp.pos.x, dz = z - sp.pos.z;
+      o.x = sp.pos.x + sl.x + dx * c + dz * s; o.z = sp.pos.z + sl.z - dx * s + dz * c; return o;
+    };
+    const Q = PV.q || (PV.q = { x: 0, z: 0 });
     for (let i = 0; i < A.list.length && P.length < POOL_MAX && k0 > 0.005; i++) {
       const a = A.list[i];
       if (!a._r || !a._r.lamp || !a.alive || a.swimming || !a.pos) continue;
-      const d = Math.hypot(a.pos.x - cam.position.x, a.pos.z - cam.position.z);
+      a._r.lamp.sp = sailOf(a); toSail(a._r.lamp.sp, a.pos.x, a.pos.z, Q);
+      const d = Math.hypot(Q.x - cam.position.x, Q.z - cam.position.z);
       if (d > POOL_FAR) continue;
-      PV.s.center.set(a.pos.x, a.pos.y, a.pos.z); PV.s.radius = POOL_R + 0.5;
+      PV.s.center.set(Q.x, a.pos.y, Q.z); PV.s.radius = POOL_R + 0.5;
       if (LV.fr.intersectsSphere(PV.s)) { a._r.lamp.pd = d; P.push(a); }
     }
     let n = 0;
@@ -17417,12 +18559,14 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
         const ok = (s.kind === 'land' || s.kind === 'deck') && Math.abs(s.y - gy) < 1.1;
         let y = ok ? s.y : gy;
         if (s.kind === 'deck' && W.deckLift) { PV.p.set(x, y, z); y += W.deckLift(PV.p); }
+        const sp = a._r.lamp.sp;
+        if (sp) toSail(sp, x, z, Q);
         // light on the ground only: it fades out up a slope and where the ground rises or drops away (no hard-edged
         // triangles climbing a cliff's foot)
         const st = fin(s.st) ? s.st : 0, dy = Math.abs(s.y - gy);
         const fade = (1 - smooth01(0.35, 0.95, st)) * (1 - smooth01(0.12, 0.8, dy));
         const v = (o + j * POOL_G + ii) * 3, w = ok ? k * fade : 0;
-        pos[v] = x; pos[v + 1] = y + 0.04; pos[v + 2] = z;
+        pos[v] = sp ? Q.x : x; pos[v + 1] = y + 0.04; pos[v + 2] = sp ? Q.z : z;
         col[v] = col[v + 1] = col[v + 2] = w;
       }
       n++;
@@ -17518,9 +18662,10 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
 
   // a swimmer leans forward (rig pitched 0.45 rad): the part above the water is ~0.4-0.9 m ahead of the feet
   const SWIM_FWD = 0.55;
-  // ray vs vertical capsule (approximated as a cylinder from feet+0.2 to feet+1.56 — just over the shoulders, r 0.45)
+  // ray vs vertical capsule (approximated as a cylinder from feet+0.2 to feet+1.56 — just over the shoulders, r 0.45;
+  // a crouching pirate's top is lower by its crouch drop)
   function rayActor(o, d, b, maxT, top) {
-    const r = 0.45, y0 = b.pos.y + 0.2, y1 = b.pos.y + (top || 1.56);
+    const r = 0.45, y0 = b.pos.y + 0.2, y1 = b.pos.y + (top || 1.56) - crDrop(b);
     const f = b.swimming ? SWIM_FWD : 0;
     const ox = o.x - b.pos.x - Math.sin(b.yaw) * f, oz = o.z - b.pos.z - Math.cos(b.yaw) * f;
     const a2 = d.x * d.x + d.z * d.z;
@@ -17658,6 +18803,7 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
     let sp = inp.aiming ? PIS.aimSpread : PIS.spread;
     if (Math.hypot(a.vel.x, a.vel.z) > 3) sp *= 1.5;
     if (!a.grounded) sp *= 1.8;
+    if (a.crouching) sp *= (G.CFG.CROUCH && G.CFG.CROUCH.spread) || 0.5;   // crouched: a steadier aim
     const pellets = PIS.pellets || 1, dirs = t.dirs || (t.dirs = []);
     dirs.length = 0;
     for (let k = 0; k < pellets; k++) {
@@ -17863,7 +19009,12 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
     if (!fin(a.pos.x) || !fin(a.pos.y) || !fin(a.pos.z)) { a.pos.copy(R.safe); a.vel.set(0, 0, 0); }
     if (!fin(a.vel.x) || !fin(a.vel.y) || !fin(a.vel.z)) a.vel.set(0, 0, 0);
     if (!a.alive) { R.climb = null; a.deadT += dt; corpse(a, dt, W, g, WY); return; }
-    if (a.leap && leapStep(a, R, dt)) return;
+    if (a.leap && leapStep(a, R, dt)) { R.flyT = 0; return; }
+    // time in the air since the last touchdown (fall damage: land); nothing on the ground, in water, on a ladder
+    if (a.grounded || a.swimming || R.climb) R.flyT = 0; else R.flyT = (R.flyT || 0) + dt;
+    // crouching (pirates, Ctrl / C held): slower, no sprinting; not in water, on a ladder or with the chest
+    a.crouching = !sk && !!inp.crouch && !a.swimming && !R.climb && !a.carrying;
+    a.crouchK = damp(a.crouchK || 0, a.crouching ? 1 : 0, 12, dt);
 
     // facing
     if (fin(inp.aimYaw)) a.yaw = wrap(a.yaw + wrap(inp.aimYaw - a.yaw) * (1 - Math.exp(-14 * dt)));
@@ -17874,7 +19025,7 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
     if (ml > 1) { mx /= ml; mz /= ml; }
     let speed = P.speed;
     if (!sk) {                                         // stamina: sprinting drains it, anything else refills it
-      const ST = CFG.STAMINA || {}, want = inp.sprint && !a.carrying && !a.swimming && ml > 0.2;
+      const ST = CFG.STAMINA || {}, want = inp.sprint && !a.carrying && !a.swimming && !a.crouching && ml > 0.2;
       if (!fin(a.stamina)) a.stamina = 1;
       if (a.tired && a.stamina >= (ST.unlock || 0.3)) a.tired = false;
       a.sprinting = want && !a.tired && a.stamina > 0;
@@ -17883,6 +19034,7 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
         if (a.stamina <= 0) a.tired = true;              // run dry: walk until it is back to `unlock`
       } else a.stamina = Math.min(1, a.stamina + dt / (ST.refill || 10));
       if (a.sprinting) speed = P.sprint || P.speed;
+      if (a.crouching) speed = P.speed * ((CFG.CROUCH && CFG.CROUCH.speed) || 0.5);
     }
     if (fin(a.speedMul) && a.speedMul >= 0) speed *= a.speedMul;
     if (a.swimming) speed *= 0.45;
@@ -18129,10 +19281,22 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
   // touchdown after a fall / jump: the knees absorb it (animate), hard ones kick up dust
   function land(a, R, v, kind) {
     R.jumped = false;
+    const air = R.flyT || 0; R.flyT = 0;
+    fallHurt(a, air);
     if (!(v > 2.5)) return;
     const s = clamp((v - 2) / 9, 0.12, 1), left = R.landT < 0.5 ? R.landS * (1 - smooth(0.1, 0.5, R.landT)) : 0;
     R.landS = Math.max(s, left); R.landT = 0;
     if (v > 8.5 && (kind === 'land' || kind === 'deck')) fx('dust', a.pos, kind === 'deck' ? 'wood' : groundKind(a.pos));
+  }
+  // a pirate landing on ground / a deck after more than FALL.t0 s in the air: (air s - t0) x FALL.dps damage, no killer,
+  // weapon 'fall' (the jump from level ground, ~0.7 s, and dropping off a tower platform are free; water catches you)
+  function fallHurt(a, air) {
+    const F = G.CFG.FALL || {}, t0 = fin(F.t0) ? F.t0 : 0.75;
+    if (a.kind === 'skeleton' || !a.alive || !(air > t0)) return;
+    const dmg = (air - t0) * (fin(F.dps) ? F.dps : 120);
+    if (dmg < 1) return;
+    sfx('thud', a.pos);
+    C.damage(a, dmg, null, 'fall', tmp().w.set(a.pos.x, a.pos.y + 0.3, a.pos.z));
   }
   // ground under a foot (lx: sideways offset), relative to the feet
   function footY(W, a, lx, c, s) {
@@ -18301,6 +19465,13 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
       torX += 0.45 * c; hdX -= 0.3 * c; aRx -= 0.35 * c; aLx -= 0.35 * c; aRz -= 0.25 * c; aLz += 0.25 * c;
     }
 
+    // ---- crouching: hips down (the eyes drop by CROUCH.drop), knees bent, leaning forward; the gait goes on in short steps
+    const ck = onFoot && !sk ? (a.crouchK || 0) : 0;
+    if (ck > 0.002) {
+      const dr = ((G.CFG.CROUCH && G.CFG.CROUCH.drop) || 0.45) * ck, cb = legBend(dr);
+      hipsDY -= dr * (1 - 0.35 * airK); thR -= cb; thL -= cb; knR += 2 * cb; knL += 2 * cb;
+      torX += 0.32 * ck; hdX -= 0.28 * ck; aRz -= 0.08 * ck; aLz += 0.08 * ck;
+    }
     if (a.swimming) {
       const cr = smooth(0.4, 1.8, spd);                                    // crawl vs treading water
       R.swim = (R.swim + dt * (0.8 + 0.35 * cr)) % 2;                     // two strokes per breath
@@ -18916,6 +20087,15 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
       const at = e.attacker, tg = e.target;
       if (!isSkel(at) && isSkel(tg) && (at.team === 0 || at.team === 1)) setHint(at.team, tg);
       else if (isSkel(at) && !isSkel(tg) && (tg.team === 0 || tg.team === 1)) setHint(tg.team, at);
+      // a pirate hit by a pirate of the other side: every bot of its team within ENGAGE_R of it answers that fire too
+      if (!isSkel(at) && !isSkel(tg) && tg.pos && at.pos && (tg.team === 0 || tg.team === 1) && hostile(tg, at)) {
+        const L = G.actors.list;
+        for (let i = 0; i < L.length; i++) {
+          const o = L[i], ob = o && o.ai;
+          if (!o || o === tg || !o.alive || !o.isBot || o.isPlayer || o.team !== tg.team || !o.pos || !ob || ob._gen !== gen) continue;
+          if (dxz(o.pos, tg.pos) <= ENGAGE_R) { ob.alertBy = at; ob.alertT = T; }
+        }
+      }
       const b = e.target.ai;
       if (!b || typeof b !== 'object') return;
       b.hitBy = e.attacker; b.hitT = T;
@@ -19028,7 +20208,7 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
     b.dirX = 0; b.dirZ = 0; b.avS = 0; b.avT = 0; b.locT = 0; b.lp = null; b.lpT = 0; b.lpX = 0; b.lpZ = 0; b.lpI = 0; b.onLocal = false;
     b.inTun = false; b.tunDir = 0; b.tunT = -99; b.tunF = -9; b.tunBackT = 0;
     b.rsX = a.pos.x; b.rsZ = a.pos.z; b.rsT = 0;
-    b.hitBy = null; b.hitT = -99;
+    b.hitBy = null; b.hitT = -99; b.alertBy = null; b.alertT = -99;
     b.state = 'idle'; b.pauseT = rnd(0, 2); b.wanderSet = false; b.wanderTO = 0; b.wanderX = 0; b.wanderZ = 0;
     b.homeX = a.home ? a.home.x : a.pos.x; b.homeZ = a.home ? a.home.z : a.pos.z;
     b.errLogged = false;
@@ -19038,7 +20218,7 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
     b.target = null; b.seenT = -99; b.threat = null;
     b.sideT = 0; b.jumpT = 0; b.stT = 0; b.stX = a.pos.x; b.stZ = a.pos.z; b.stY = a.pos.y; b.wRot = 0; b.wT = 0;
     b.stN = 0; b.stkT = -99; b.noNavT = 0;
-    b.huntT = -1; b.hitBy = null; b.hitT = -99; b.burstOn = false; b.burstT = 0;
+    b.huntT = -1; b.hitBy = null; b.hitT = -99; b.alertBy = null; b.alertT = -99; b.burstOn = false; b.burstT = 0;
     b.state = 'idle'; b.pauseT = rnd(0.5, 2); b.wanderSet = false;
     b.thinkT = 0;
     b.pick = null; b.pickCur = null; b.pickAcc = 0; b.pickBan.length = 0; b.pickClaim = null; b.cvNear = null; b.sx = null;
@@ -19062,7 +20242,7 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
 
   function resetButtons(i) {
     i.sprint = false; i.jump = false; i.fire = false; i.reload = false;
-    i.melee = false; i.interact = false; i.aiming = false;
+    i.melee = false; i.interact = false; i.aiming = false; i.crouch = false;
   }
 
   function clearInput(a) {
@@ -19548,6 +20728,7 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
   function pickRange(a, b, pk) {
     if (!a.alive || !a.isBot || a.isPlayer || !a.arms || a.carrying || !a.pos || !pk || pk.falling) return 0;
     if (b.mode === 'carry' || b.mode === 'raid' || a.arms[pk.id] || b.pickBan.indexOf(pk) >= 0) return 0;
+    if (upTower(pk.pos)) return 0;                  // a gun up on a watchtower: bots leave it (they got stuck under it)
     const unarmed = !a.arms.smg && !a.arms.shotgun && !a.arms.sniper;
     return b.mode === 'hunt' && unarmed ? 45 : 10;
   }
@@ -19581,6 +20762,11 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
     }
   }
 
+  // up on a watchtower (its platform / ramp, clear of the ground)?
+  function upTower(p) {
+    return !!p && typeof W.onTower === 'function' && typeof W.heightAt === 'function' && W.onTower(p.x, p.z, 0.3) &&
+      p.y > W.heightAt(p.x, p.z) + 1;
+  }
   function pickHunt(a, b, known) {
     if (!known && typeof W.randomLand === 'function') {
       try {
@@ -19642,6 +20828,7 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
               x = h.x + (h.hx - h.x) * t + Math.sin(ang) * j; z = h.z + (h.hz - h.z) * t + Math.cos(ang) * j;
             } else { const ang = Math.random() * TAU, r = rnd(6, 22); x = h.x + Math.sin(ang) * r; z = h.z + Math.cos(ang) * r; }
             if (typeof W.navReach === 'function' && !W.navReach(x, z)) continue;
+            if (typeof W.onTower === 'function' && W.onTower(x, z, 1)) continue;
             if (typeof W.heightAt === 'function' && !(W.heightAt(x, z) > 0.3)) continue;
             b.sx = x; b.sz = z; b.sT = T + rnd(7, 11); break;
           }
@@ -19716,14 +20903,17 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
   }
 
   // does bot a notice enemy o at distance d? It sees ~240 deg around where it faces; closer than 7 m, gunfire
-  // (40 m), the chest carrier (25 m), whoever just hit it and the target it is tracking are noticed from any side
-  function noticed(a, b, o, d, recentHit) {
-    if (d < 7 || o === recentHit || (o === b.target && T - b.seenT < 1.5)) return true;
+  // (40 m), the chest carrier (25 m), whoever just hit it / a teammate near it (alert) and the target it is tracking
+  // are noticed from any side. A pirate crouching in its back half (behind its shoulders) is not noticed at all, however
+  // close — unless it fires, hits it, or is the target it is tracking
+  function noticed(a, b, o, d, recentHit, alert) {
+    if (o === recentHit || o === alert || (o === b.target && T - b.seenT < 1.5)) return true;
+    const st = shotT.get(o), fired = st != null && G.time - st < 1.2 && G.time >= st && d < 40;
+    const y = fin(a.yaw) ? a.yaw : 0, off = Math.abs(angDiff(y, Math.atan2(o.pos.x - a.pos.x, o.pos.z - a.pos.z)));
+    if (o.crouching && off > Math.PI / 2) return fired;
+    if (d < 7 || fired) return true;
     if (o.carrying && d < 25) return true;
-    const st = shotT.get(o);
-    if (st != null && G.time - st < 1.2 && G.time >= st && d < 40) return true;
-    const y = fin(a.yaw) ? a.yaw : 0;
-    return Math.abs(angDiff(y, Math.atan2(o.pos.x - a.pos.x, o.pos.z - a.pos.z))) < FOV;
+    return off < FOV;
   }
 
   function insertCand(o, s) {
@@ -19741,14 +20931,16 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
     cand.length = 0; candS.length = 0;
     const carrier = chest && chest.state === 'carried' ? chest.carrier : null;
     const recentHit = b.hitBy && (T - b.hitT) < 4 ? b.hitBy : null;
+    const alert = b.alertBy && (T - b.alertT) < 4 ? b.alertBy : null;   // a teammate near us was shot by him
     for (let i = 0; i < list.length; i++) {
       const o = list[i];
       if (!o || o === a || !o.alive || !o.pos) continue;
       if (!hostile(a, o)) continue;
       const d = dxz(P, o.pos);
       // out of range: only the one who shot us lately (from however far: we answer his fire while he keeps hitting us)
-      if (!(d <= (a.arms && a.arms.sniper ? 75 : ENGAGE_R)) && o !== recentHit && !(o === b.target && o === b.hitBy && T - b.hitT < 10)) continue;
-      if (!isSkel(o) && !noticed(a, b, o, d, recentHit)) continue;       // behind its back: sneak up / flank
+      if (!(d <= (a.arms && a.arms.sniper ? 75 : ENGAGE_R)) && o !== recentHit && o !== alert &&
+          !(o === b.target && (o === b.hitBy && T - b.hitT < 10 || o === b.alertBy && T - b.alertT < 10))) continue;
+      if (!isSkel(o) && !noticed(a, b, o, d, recentHit, alert)) continue;       // behind its back: sneak up / flank
       let s = d;
       if (isSkel(o)) {
         const onMe = !!(o.ai && o.ai.target === a);
@@ -19757,7 +20949,10 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
         if (onMe) s -= 6;
       }
       if (o.carrying) s -= 15;
-      if (recentHit === o) s -= 10;
+      // a pirate that just shot us (or a teammate near us) comes first, even mid-fight with skeletons: they are left
+      // till he is dealt with (else the bots were picked off from afar while busy with the neutrals)
+      if (recentHit === o) s -= isSkel(o) ? 10 : 1000;
+      else if (alert === o) s -= 990;
       if (o === b.target) s -= 4;
       if (mode === 'escort' && carrier && carrier.pos && dxz(o.pos, carrier.pos) < 15) s -= 6;
       insertCand(o, s);
@@ -19845,8 +21040,9 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
     if (a.carrying) { b.target = null; return; }
     selectTarget(a, b, mode, chest);
     // shot by someone we cannot see: turn towards where it came from and go and look (the next look finds him)
-    const hb = b.hitBy;
-    if (hb && hb.alive && hb.pos && !isSkel(hb) && hostile(a, hb) && T - b.hitT < 2.5 && b.target !== hb && (!b.target || T - b.seenT > 0.6)) {
+    // (the same for one who just shot a teammate near us)
+    const hb = b.hitBy && T - b.hitT < 2.5 ? b.hitBy : b.alertBy && T - b.alertT < 2.5 ? b.alertBy : null;
+    if (hb && hb.alive && hb.pos && !isSkel(hb) && hostile(a, hb) && b.target !== hb && (!b.target || T - b.seenT > 0.6)) {
       b.target = hb; b.seenT = T - 0.5; b.lx = hb.pos.x; b.ly = hb.pos.y; b.lz = hb.pos.z;
     }
   }
@@ -20329,7 +21525,7 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
   function zeroInput(inp) {
     inp.mx = 0; inp.mz = 0;
     inp.sprint = false; inp.jump = false; inp.fire = false; inp.reload = false;
-    inp.melee = false; inp.interact = false; inp.aiming = false;
+    inp.melee = false; inp.interact = false; inp.aiming = false; inp.crouch = false;
   }
   function campCenter(out) {
     const camp = G.world && G.world.camp;
@@ -20516,7 +21712,7 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
     const fS = pick && !W.forceShape && !urlHas('shape') && W.shapes && W.shapes.length;
     const fD = pick && !W.forceDecor && !urlHas('decor') && G.decor && G.decor.order && G.decor.order.length;
     if (fS) W.forceShape = fresh('shape', W.shapes);
-    if (fD) W.forceDecor = fresh('decor', G.decor.order);
+    if (fD) W.forceDecor = fresh('decor', G.decor.order.filter((id) => !G.decor.TYPES[id].solo));   // (the giant is no theme)
     const nS = net && net.shape, nD = net && net.decor;         // online: the host's map
     if (nS) W.forceShape = nS;
     if (nD) W.forceDecor = nD;
@@ -20751,14 +21947,17 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
       if (ey) cam.pitch = U.clamp(cam.pitch - ey * Math.abs(ey) * 1.6 * dt * (M.sens || 1), -1.1, 0.9);
     }
     const sy = Math.sin(cam.yaw), cy = Math.cos(cam.yaw);
-    const f = (I.isDown('KeyW') || I.isDown('ArrowUp') ? 1 : 0) - (I.isDown('KeyS') || I.isDown('ArrowDown') ? 1 : 0);
-    const s = (I.isDown('KeyD') || I.isDown('ArrowRight') ? 1 : 0) - (I.isDown('KeyA') || I.isDown('ArrowLeft') ? 1 : 0);
+    let f = (I.isDown('KeyW') || I.isDown('ArrowUp') ? 1 : 0) - (I.isDown('KeyS') || I.isDown('ArrowDown') ? 1 : 0);
+    let s = (I.isDown('KeyD') || I.isDown('ArrowRight') ? 1 : 0) - (I.isDown('KeyA') || I.isDown('ArrowLeft') ? 1 : 0);
+    const st = I.stick;                                    // a touch joystick (playable.js): analog, pushed to the rim = run
+    if (st && (st.x || st.y)) { f = st.y; s = st.x; }
     // forward = (sin yaw, cos yaw); right = (-cos yaw, sin yaw)
     let mx = sy * f - cy * s, mz = cy * f + sy * s;
     const len = Math.hypot(mx, mz);
     if (len > 1) { mx /= len; mz /= len; }
     inp.mx = mx; inp.mz = mz;
-    inp.sprint = I.isDown('ShiftLeft') || I.isDown('ShiftRight');
+    inp.sprint = I.isDown('ShiftLeft') || I.isDown('ShiftRight') || !!(st && st.run);
+    inp.crouch = I.isDown('ControlLeft') || I.isDown('ControlRight') || I.isDown('KeyC');
     inp.jump = I.isDown('Space');
     inp.fire = !!I.lmb && G.time - lockT > 0.2;
     inp.aiming = !!I.rmb;
@@ -21192,7 +22391,7 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
       '<li>С сундуком вы идёте медленнее и не можете стрелять — пусть команда прикрывает.</li>' +
       '</ul>';
     const keys = [
-      ['W A S D', 'движение'], ['Shift', 'бег'], ['Пробел', 'прыжок'], ['ЛКМ', 'выстрел'],
+      ['W A S D', 'движение'], ['Shift', 'бег'], ['Ctrl / C', 'присесть'], ['Пробел', 'прыжок'], ['ЛКМ', 'выстрел'],
       ['ПКМ', 'прицел'], ['R', 'перезарядка'], ['1–5', 'выбор оружия (или колесо)'], ['F', 'удар саблей'], ['E', 'взять / бросить сундук'],
       ['Tab', 'счёт'], ['Esc', 'пауза'], ['M', 'звук'], ['N', 'музыка'],
     ];
@@ -21466,7 +22665,7 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
     G.on('kill', (e) => {
       const M = G.match; if (!e || !e.victim || !M || !M.running || (G.net && G.net.quiet)) return;   // (net.js: a late start's catching up)
       const k = e.killer, v = e.victim, p = M.player;
-      if (v === p) lastKiller = k ? 'Вас сразил: ' + k.name : e.weapon === 'tree' ? 'Вас придавило деревом' : '';
+      if (v === p) lastKiller = k ? 'Вас сразил: ' + k.name : e.weapon === 'tree' ? 'Вас придавило деревом' : e.weapon === 'fall' ? 'Вы разбились' : '';
       if (k && k === p && v !== p) { killHitT = 0.4; hitT = 0.4; }
       addFeed(k, v, e.weapon, (k && k === p) || v === p);
     });
@@ -21499,7 +22698,7 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
         (wt ? '<i>' + wt + '</i>' : ' ') + '<span class="pz-arr">⟶</span>' +
         '<span style="color:' + actorCss(v) + '">' + esc(v.name) + '</span>';
     } else {
-      html = '<span style="color:' + actorCss(v) + '">' + esc(v.name) + '</span><i>' + (weapon === 'tree' ? 'убило деревом' : 'погиб') + '</i>';
+      html = '<span style="color:' + actorCss(v) + '">' + esc(v.name) + '</span><i>' + (weapon === 'tree' ? 'убило деревом' : weapon === 'fall' ? 'разбился' : 'погиб') + '</i>';
     }
     const node = h('div', 'pz-kf' + (mine ? ' me' : ''), el.feed);
     node.innerHTML = html;
@@ -22332,12 +23531,12 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
     const q = new URLSearchParams(location.search);
     if (!window.crypto || !crypto.subtle) { C.setStatus('Сетевой игре нужен https (или localhost)', true); return { link: null, start() {}, scan() {}, leave() {}, maybeRelease() {}, moveAll() {}, tick() {}, hello() {}, up: () => false, lost() {}, log: () => [] }; }
     const local = q.get('net') === 'local' && !!window.BroadcastChannel;
-    const room = 'pirates-online|' + (q.get('room') ? 'room:' + q.get('room') : (location.host || location.pathname));
+    const room = 'pirates-online|' + (q.get('room') ? 'room:' + q.get('room') : 'main');   // (one for every copy: not per site / file path)
     const ice = local ? [] : STUN.slice();
     if (q.get('turn')) ice.push({ urls: q.get('turn'), username: q.get('tu') || '', credential: q.get('tp') || '' });
     // a named room (?room=): one lobby only — filling up or playing; a playing one takes newcomers in place of bots
     // (net.js), nobody makes a second one while it is there. Without a name: parallel lobbies as before
-    const single = true;                      // (every room — the site's address or ?room= — has one lobby)
+    const single = true;                      // (every room — the common one or ?room= — has one lobby)
     const direct = q.get('relay') !== '1' && !!window.RTCPeerConnection;   // ?relay=1: straight through the servers
     const relayed = new Set();                // hosts we could not reach directly: through the servers next time too
 
@@ -22540,7 +23739,7 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
     function up(m) { if (pr && m[0] === 'l') { const P = pr; pr = null; P.lobby(m[1]); return true; } return false; }
     function lost(silent) { if (hostId) pass(hostId, silent ? GHOST_S : 5); }
 
-    G.relay = { bus, lobbies, ghosts, link, info: () => ({ me: bus.me, room: q.get('room') || location.host || location.pathname, servers: bus.servers.map((s) => s.kind + ' ' + s.url + (s.up ? ' up' : ' down') + ' rx ' + (s.rx | 0) + (s.rejects ? ' rejected ' + s.rejects : '') + (s.err ? ' (' + s.err + ')' : '')),
+    G.relay = { bus, lobbies, ghosts, link, info: () => ({ me: bus.me, room: q.get('room') || 'main', servers: bus.servers.map((s) => s.kind + ' ' + s.url + (s.up ? ' up' : ' down') + ' rx ' + (s.rx | 0) + (s.rejects ? ' rejected ' + s.rejects : '') + (s.err ? ' (' + s.err + ')' : '')),
       sent: bus.sent, fastSent: bus.fastSent, got: bus.got, dup: bus.dup, bad: bus.bad, links: link.list(),
       lobbies: [...lobbies].map(([id, e]) => id + (alive(e) ? '' : ' (silent)') + (e.run ? ' playing' : '') + ' ' + e.n.join(':')) }),
       selfTest: async () => { const K = nostrKeys(), m = await sha256(te.encode('x')), s = await schnorr(m, K); return schnorrVerify(K.pub, m, s); } };
@@ -22629,7 +23828,12 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
   // the player's own name (asked once, kept in this browser): «Введите имя» on the first crew button, «Сменить имя»
   const NAME_KEY = 'pirates.name';
   const cleanName = (s) => String(s == null ? '' : s).replace(/[\u0000-\u001f<>]/g, '').replace(/\s+/g, ' ').trim().slice(0, 18);
-  function myName() { try { return cleanName(localStorage.getItem(NAME_KEY)); } catch (e) { return cleanName(N.name0); } }
+  function myName() {
+    let s = '';
+    try { s = cleanName(localStorage.getItem(NAME_KEY)); } catch (e) { s = cleanName(N.name0); }
+    if (!s && G.playable) s = N.name0 || (N.name0 = 'Юнга ' + (10 + Math.floor(Math.random() * 90)));   // (an ad: no name to type first)
+    return s;
+  }
   function saveName(s) { N.name0 = s; try { localStorage.setItem(NAME_KEY, s); } catch (e) { /* storage blocked: this visit only */ } }
   // a round's crews as names (people and bots) while it runs, for the lobby's lists
   function crewNow() {
@@ -22840,7 +24044,7 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
   function zeroInput(inp) {
     if (!inp) return;
     inp.mx = 0; inp.mz = 0; inp.sprint = false; inp.jump = false; inp.fire = false; inp.reload = false;
-    inp.melee = false; inp.interact = false; inp.aiming = false;
+    inp.melee = false; inp.interact = false; inp.aiming = false; inp.crouch = false;
   }
   function flagsOf(a) {
     const inp = a.input || {};
@@ -22855,6 +24059,7 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
     if (inp.interact) f |= 128;
     if (a.carrying) f |= 256;
     if (a.weapon && a.weapon.reloading) f |= 512;
+    if (inp.crouch) f |= 1024;
     return f;
   }
   function sendSnap() {
@@ -22942,7 +24147,7 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
     const inp = a.input, f = m[12];
     inp.mx = +m[10] || 0; inp.mz = +m[11] || 0; inp.aimYaw = +m[9] || 0;
     inp.sprint = !!(f & 2); inp.jump = !!(f & 4); inp.fire = !!(f & 8); inp.aiming = !!(f & 16);
-    inp.reload = !!(f & 32); inp.melee = !!(f & 64); inp.interact = !!(f & 128);
+    inp.reload = !!(f & 32); inp.melee = !!(f & 64); inp.interact = !!(f & 128); inp.crouch = !!(f & 1024);
     if (inp.aim) inp.aim.set(+m[13] || 0, +m[14] || 0, +m[15] || 0);
     const T = a.net || (a.net = { p: new G.THREE.Vector3(), v: new G.THREE.Vector3(), t: 0, life: 0 });
     T.p.set(+m[2], +m[3], +m[4]); T.v.set(+m[5] || 0, +m[6] || 0, +m[7] || 0); T.t = now(); T.life = m[1] | 0;
@@ -23017,7 +24222,7 @@ return {computeMikkTSpaceTangents:computeMikkTSpaceTangents,mergeGeometries:merg
       const inp = a.input;
       inp.mx = r[8]; inp.mz = r[9]; inp.aimYaw = r[7];
       inp.sprint = !!(f & 2); inp.jump = !!(f & 4); inp.fire = !!(f & 8); inp.aiming = !!(f & 16);
-      inp.reload = !!(f & 32); inp.melee = !!(f & 64); inp.interact = !!(f & 128);
+      inp.reload = !!(f & 32); inp.melee = !!(f & 64); inp.interact = !!(f & 128); inp.crouch = !!(f & 1024);
       if (inp.aim) inp.aim.set(r[11], r[12], r[13]);
       const cur = r[15] || null;
       if (a.kind === 'pirate' && a.alive && cur && cur !== a.cur) { ensureArm(a, cur); G.actors.select(a, cur); }
